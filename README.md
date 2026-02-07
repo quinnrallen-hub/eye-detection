@@ -1,24 +1,30 @@
 # Eye Detection
 
-Real-time eye open/closed detection using MediaPipe face landmarks and Eye Aspect Ratio (EAR).
+Real-time eye open/closed detection using a custom-trained CNN (98% accuracy).
 
 ## Features
 
-- Webcam and ESP32-CAM support
-- Real-time EAR-based eye state detection
-- Auto-threshold adjustment based on brightness
+- Custom CNN trained from scratch on eye images
+- No external ML models required (just OpenCV + PyTorch)
+- Webcam support
 - Live eye crop preview
 
 ## Requirements
 
 ```bash
-pip install opencv-python mediapipe numpy pillow torch
+pip install opencv-python numpy pillow torch
 ```
 
 ## Usage
 
 ```bash
 python gui.py
+```
+
+For MediaPipe version (more accurate eye tracking):
+```bash
+pip install mediapipe
+python gui_mediapipe.py
 ```
 
 ### ESP32-CAM Setup

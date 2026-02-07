@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Eye open/closed detection GUI.
-Uses MediaPipe FaceLandmarker to find eyes, custom CNN to classify open/closed.
+Uses OpenCV Haar cascades for eye detection, custom CNN to classify open/closed.
+NO MediaPipe - only OpenCV + your trained model.
 """
 
 import tkinter as tk
@@ -9,15 +10,17 @@ from tkinter import ttk
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
-import mediapipe as mp
 import torch
 import torch.nn as nn
 
 # --- Config ---
 IMG_SIZE = 64
 MODEL_PATH = "/home/quinn/eye_detection_project/eye_classifier.pth"
-LANDMARKER_PATH = "/home/quinn/eye_detection_project/face_landmarker.task"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# OpenCV Haar cascades (built into OpenCV)
+FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+EYE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
 
 
 class EyeCNN(nn.Module):
@@ -59,50 +62,28 @@ class EyeCNN(nn.Module):
         return x
 
 
-# ESP32-CAM stream URL (change IP to match your camera)
-ESPCAM_URL = "http://192.168.251.119:81/stream"
-
-# MediaPipe landmark indices (from subject's perspective)
-# Left eye = 362-398 range, Right eye = 33-173 range
-LEFT_EYE_CONTOUR = [362, 382, 381, 380, 374, 373, 390, 249,
-                    263, 466, 388, 387, 386, 385, 384, 398]
-RIGHT_EYE_CONTOUR = [33, 7, 163, 144, 145, 153, 154, 155,
-                     133, 173, 157, 158, 159, 160, 161, 246]
-
-# 6-point subsets for EAR: [p1, p2, p3, p4, p5, p6]
-LEFT_EYE_EAR = [362, 385, 387, 263, 373, 380]
-RIGHT_EYE_EAR = [33, 160, 158, 133, 153, 144]
-
-EAR_THRESHOLD = 0.22
-PADDING = 0.4
-
-
 class EyeDetectorGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Eye Open/Closed Detector")
-        self.root.geometry("800x700")
+        self.root.title("Eye Detector (No MediaPipe)")
+        self.root.geometry("800x650")
 
         # State
         self.cap = None
         self.running = False
-        self.current_cam = 0
-        self.available_cameras = []
         self.threshold = 0.5
         self.frame_count = 0
         self.last_left_prob = None
         self.last_right_prob = None
-        self.inference_interval = 3  # Only run CNN every N frames
+        self.inference_interval = 3
 
-        # Load models
+        # Load model
         self.model = self._load_model()
-        self.landmarker = self._load_landmarker()
 
         # Build UI
         self._setup_ui()
 
         # Start
-        self._detect_cameras()
         self._start_stream()
 
     def _load_model(self):
@@ -110,14 +91,6 @@ class EyeDetectorGUI:
         model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True))
         model.eval()
         return model
-
-    def _load_landmarker(self):
-        options = mp.tasks.vision.FaceLandmarkerOptions(
-            base_options=mp.tasks.BaseOptions(model_asset_path=LANDMARKER_PATH),
-            running_mode=mp.tasks.vision.RunningMode.IMAGE,
-            num_faces=1,
-        )
-        return mp.tasks.vision.FaceLandmarker.create_from_options(options)
 
     def _setup_ui(self):
         main = ttk.Frame(self.root, padding=10)
@@ -128,18 +101,9 @@ class EyeDetectorGUI:
         top.pack(fill=tk.X, pady=5)
 
         ttk.Label(top, text="Camera:").pack(side=tk.LEFT, padx=5)
-        self.cam_var = tk.StringVar()
-        self.cam_combo = ttk.Combobox(top, textvariable=self.cam_var, state="readonly", width=12)
-        self.cam_combo.pack(side=tk.LEFT, padx=5)
-        self.cam_combo.bind("<<ComboboxSelected>>", self._on_camera_change)
-        ttk.Button(top, text="Refresh", command=self._detect_cameras).pack(side=tk.LEFT, padx=5)
-
-        # ESP URL input
-        ttk.Label(top, text="ESP IP:").pack(side=tk.LEFT, padx=(15, 5))
-        self.esp_ip_var = tk.StringVar(value="192.168.251.119")
-        self.esp_ip_entry = ttk.Entry(top, textvariable=self.esp_ip_var, width=15)
-        self.esp_ip_entry.pack(side=tk.LEFT, padx=2)
-        ttk.Button(top, text="Connect ESP", command=self._connect_esp).pack(side=tk.LEFT, padx=5)
+        self.cam_var = tk.IntVar(value=0)
+        ttk.Spinbox(top, from_=0, to=4, textvariable=self.cam_var, width=5).pack(side=tk.LEFT, padx=5)
+        ttk.Button(top, text="Switch", command=self._switch_camera).pack(side=tk.LEFT, padx=5)
 
         # Video display
         self.video_canvas = tk.Canvas(main, width=640, height=400, bg="black")
@@ -173,16 +137,6 @@ class EyeDetectorGUI:
         self.right_label = ttk.Label(result_frame, textvariable=self.right_var, font=("Helvetica", 16, "bold"))
         self.right_label.pack(side=tk.LEFT, padx=30)
 
-        # EAR and brightness display
-        info_frame = ttk.Frame(main)
-        info_frame.pack(pady=2)
-
-        self.ear_var = tk.StringVar(value="EAR: --")
-        ttk.Label(info_frame, textvariable=self.ear_var, font=("Helvetica", 11)).pack(side=tk.LEFT, padx=20)
-
-        self.bright_var = tk.StringVar(value="Brightness: --")
-        ttk.Label(info_frame, textvariable=self.bright_var, font=("Helvetica", 11)).pack(side=tk.LEFT, padx=20)
-
         # Threshold slider
         thresh_frame = ttk.Frame(main)
         thresh_frame.pack(pady=10, fill=tk.X, padx=50)
@@ -197,146 +151,25 @@ class EyeDetectorGUI:
         self.thresh_label = ttk.Label(thresh_frame, text="0.50", width=5)
         self.thresh_label.pack(side=tk.LEFT, padx=5)
 
-        ttk.Button(thresh_frame, text="Auto", command=self._auto_threshold_btn).pack(side=tk.LEFT, padx=10)
-
-        self.auto_thresh_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(thresh_frame, text="Continuous", variable=self.auto_thresh_var).pack(side=tk.LEFT)
-
-    def _detect_cameras(self):
-        self.available_cameras = []
-
-        # Check local cameras
-        for i in range(5):
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                ret, _ = cap.read()
-                if ret:
-                    self.available_cameras.append(("local", i, f"Camera {i}"))
-                cap.release()
-
-        # Add ESP32-CAM option
-        self.available_cameras.append(("esp", ESPCAM_URL, "ESP32-CAM"))
-
-        if self.available_cameras:
-            self.cam_combo["values"] = [c[2] for c in self.available_cameras]
-            self.cam_combo.current(0)
-        else:
-            self.cam_combo["values"] = ["No cameras"]
-            self.cam_combo.current(0)
-            self.status_var.set("No cameras found")
+    def _switch_camera(self):
+        if self.cap:
+            self.cap.release()
+        self.cap = cv2.VideoCapture(self.cam_var.get())
+        if not self.running:
+            self.running = True
+            self._update()
 
     def _start_stream(self):
-        if not self.available_cameras:
-            return
-
-        self.current_cam = self.available_cameras[0]
-        self._open_camera(self.current_cam)
-
-        if self.cap and self.cap.isOpened():
+        self.cap = cv2.VideoCapture(0)
+        if self.cap.isOpened():
             self.running = True
             self._update()
         else:
-            self.status_var.set("Failed to open camera")
-
-    def _open_camera(self, cam_info):
-        """Open camera by type (local index or ESP URL)."""
-        if self.cap:
-            self.cap.release()
-
-        cam_type, cam_source, _ = cam_info
-        if cam_type == "local":
-            self.cap = cv2.VideoCapture(cam_source)
-        else:  # esp
-            self.cap = cv2.VideoCapture(cam_source)
-            # Set buffer size low for lower latency
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-    def _on_camera_change(self, event=None):
-        idx = self.cam_combo.current()
-        if 0 <= idx < len(self.available_cameras):
-            new_cam = self.available_cameras[idx]
-            if new_cam != self.current_cam:
-                self.current_cam = new_cam
-                self._open_camera(new_cam)
+            self.status_var.set("No camera found")
 
     def _on_threshold_change(self, value):
         self.threshold = float(value)
         self.thresh_label.config(text=f"{self.threshold:.2f}")
-
-    def _connect_esp(self):
-        """Connect to ESP32-CAM using IP from entry field."""
-        ip = self.esp_ip_var.get().strip()
-        if not ip:
-            self.status_var.set("Enter ESP IP address")
-            return
-
-        url = f"http://{ip}:81/stream"
-        self.status_var.set(f"Connecting to {ip}...")
-        self.root.update()
-
-        if self.cap:
-            self.cap.release()
-
-        self.cap = cv2.VideoCapture(url)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        if self.cap.isOpened():
-            ret, _ = self.cap.read()
-            if ret:
-                self.current_cam = ("esp", url, f"ESP@{ip}")
-                self.status_var.set(f"Connected to ESP@{ip}")
-                if not self.running:
-                    self.running = True
-                    self._update()
-            else:
-                self.status_var.set(f"ESP at {ip} not streaming")
-        else:
-            self.status_var.set(f"Failed to connect to {ip}")
-
-    def _compute_ear(self, landmarks, indices):
-        """Eye Aspect Ratio = (|p2-p6| + |p3-p5|) / (2 * |p1-p4|)"""
-        def dist(a, b):
-            return np.sqrt((a.x - b.x)**2 + (a.y - b.y)**2)
-
-        pts = [landmarks[i] for i in indices]
-        v1 = dist(pts[1], pts[5])
-        v2 = dist(pts[2], pts[4])
-        h = dist(pts[0], pts[3])
-
-        return (v1 + v2) / (2.0 * h) if h > 1e-6 else 0.0
-
-    def _crop_eye(self, frame, landmarks, indices):
-        """Crop eye region with padding, return crop or None."""
-        h, w = frame.shape[:2]
-
-        xs = [landmarks[i].x * w for i in indices]
-        ys = [landmarks[i].y * h for i in indices]
-
-        cx, cy = np.mean(xs), np.mean(ys)
-        size = max(max(xs) - min(xs), max(ys) - min(ys))
-        half = size * (0.5 + PADDING)
-
-        x1 = int(max(0, cx - half))
-        y1 = int(max(0, cy - half))
-        x2 = int(min(w, cx + half))
-        y2 = int(min(h, cy + half))
-
-        if x2 - x1 < 10 or y2 - y1 < 10:
-            return None, (0, 0, 0, 0)
-
-        return frame[y1:y2, x1:x2].copy(), (x1, y1, x2, y2)
-
-    def _predict_ear(self, ear_value):
-        """Use EAR to determine if eye is open. Returns open probability."""
-        # EAR > 0.22 typically means open, < 0.22 means closed
-        # Convert to a probability-like value
-        if ear_value > 0.30:
-            return 1.0
-        elif ear_value < 0.15:
-            return 0.0
-        else:
-            # Linear interpolation between 0.15 and 0.30
-            return (ear_value - 0.15) / 0.15
 
     def _preprocess_crop(self, crop):
         """Preprocess a single crop for CNN."""
@@ -359,7 +192,6 @@ class EyeDetectorGUI:
             return None, None
 
         try:
-            # Build batch
             tensors = []
             left_idx, right_idx = -1, -1
             if left_tensor is not None:
@@ -383,66 +215,47 @@ class EyeDetectorGUI:
             print(f"CNN predict error: {e}")
             return None, None
 
-    def _predict_cnn(self, crop):
-        """Use custom CNN to predict if eye is open. Returns open probability."""
-        if crop is None or crop.size == 0:
-            return None
-
-        h, w = crop.shape[:2]
-        if h < 10 or w < 10:
-            return None
-
-        try:
-            # Preprocess: RGB, resize, normalize to 0-1
-            img = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
-            img = img.astype(np.float32) / 255.0
-            img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
-
-            # Run inference
-            with torch.no_grad():
-                output = self.model(img)
-                probs = torch.softmax(output, dim=1)
-                # Class 0 = open, Class 1 = closed
-                open_prob = probs[0, 0].item()
-
-            return open_prob
-        except Exception as e:
-            print(f"CNN predict error: {e}")
-            return None
-
-    def _get_brightness(self, frame):
-        """Get average brightness of frame (0-255)."""
+    def _detect_eyes(self, frame):
+        """Detect face and estimate eye positions. Returns list of eye boxes."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        return np.mean(gray)
 
-    def _auto_threshold(self, frame):
-        """Adjust threshold based on frame brightness."""
-        brightness = self._get_brightness(frame)
+        # Detect faces
+        faces = FACE_CASCADE.detectMultiScale(gray, 1.3, 5)
 
-        # More aggressive mapping:
-        # Very bright (>180): threshold 0.25 (very easy detection)
-        # Very dark (<40): threshold 0.80 (strict detection)
-        # Map brightness 40-180 to threshold 0.80-0.25
-        if brightness > 180:
-            new_thresh = 0.25
-        elif brightness < 40:
-            new_thresh = 0.80
-        else:
-            # Linear interpolation
-            new_thresh = 0.80 - (brightness - 40) * (0.55 / 140)
+        if len(faces) == 0:
+            return [], None
 
-        self.threshold = new_thresh
-        self.thresh_var.set(new_thresh)
-        self.thresh_label.config(text=f"{new_thresh:.2f}")
+        # Use largest face
+        fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
 
-    def _auto_threshold_btn(self):
-        """Button callback for auto threshold."""
-        if self.cap and self.cap.isOpened():
-            ret, frame = self.cap.read()
-            if ret:
-                self._auto_threshold(frame)
+        # Estimate eye positions based on face proportions
+        # Eyes are about 40% down from top of face, smaller boxes
+        eye_h = int(fh * 0.12)  # Eye height (smaller)
+        eye_w = int(fw * 0.20)  # Eye width (smaller)
+        eye_y = fy + int(fh * 0.35)  # Eyes at 35% down from top
 
+        # Right eye (left side of image) - note: from camera's perspective
+        right_eye_x = fx + int(fw * 0.18)
+        # Left eye (right side of image)
+        left_eye_x = fx + int(fw * 0.62)
+
+        # Create eye boxes with small padding
+        pad = int(eye_w * 0.2)
+        right_box = (
+            max(0, right_eye_x - pad),
+            max(0, eye_y - pad),
+            min(frame.shape[1], right_eye_x + eye_w + pad),
+            min(frame.shape[0], eye_y + eye_h + pad)
+        )
+        left_box = (
+            max(0, left_eye_x - pad),
+            max(0, eye_y - pad),
+            min(frame.shape[1], left_eye_x + eye_w + pad),
+            min(frame.shape[0], eye_y + eye_h + pad)
+        )
+
+        face_box = (fx, fy, fx + fw, fy + fh)
+        return [right_box, left_box], face_box
 
     def _update(self):
         if not self.running:
@@ -457,36 +270,24 @@ class EyeDetectorGUI:
             self.root.after(30, self._update)
             return
 
-        # Update brightness display and auto-adjust threshold if enabled
-        brightness = self._get_brightness(frame)
-        self.bright_var.set(f"Brightness: {brightness:.0f}")
-
-        if self.auto_thresh_var.get():
-            self._auto_threshold(frame)
-
         h, w = frame.shape[:2]
         display = frame.copy()
 
-        # Detect face
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        result = self.landmarker.detect(mp_img)
+        # Detect eyes
+        eye_boxes, face_box = self._detect_eyes(frame)
 
         left_prob, right_prob = None, None
+        left_crop, right_crop = None, None
 
-        if result.face_landmarks:
-            lm = result.face_landmarks[0]
+        if len(eye_boxes) == 2:
+            # Eyes detected - right eye is first (left side of image)
+            right_box = eye_boxes[0]
+            left_box = eye_boxes[1]
 
-            # EAR - use this for detection (more reliable than CNN)
-            left_ear = self._compute_ear(lm, LEFT_EYE_EAR)
-            right_ear = self._compute_ear(lm, RIGHT_EYE_EAR)
-            self.ear_var.set(f"EAR: L={left_ear:.2f} R={right_ear:.2f}")
+            right_crop = frame[right_box[1]:right_box[3], right_box[0]:right_box[2]]
+            left_crop = frame[left_box[1]:left_box[3], left_box[0]:left_box[2]]
 
-            # Get eye crops for prediction
-            left_crop, left_box = self._crop_eye(frame, lm, LEFT_EYE_CONTOUR)
-            right_crop, right_box = self._crop_eye(frame, lm, RIGHT_EYE_CONTOUR)
-
-            # Only run CNN every N frames to reduce lag
+            # Run CNN every N frames
             self.frame_count += 1
             if self.frame_count >= self.inference_interval:
                 self.frame_count = 0
@@ -495,50 +296,35 @@ class EyeDetectorGUI:
             left_prob = self.last_left_prob
             right_prob = self.last_right_prob
 
-            # Get face bounding box for zoom
-            face_xs = [lm[i].x * w for i in range(len(lm))]
-            face_ys = [lm[i].y * h for i in range(len(lm))]
-            fx1, fx2 = int(min(face_xs)), int(max(face_xs))
-            fy1, fy2 = int(min(face_ys)), int(max(face_ys))
+            # Draw rectangles
+            left_color = (0, 255, 0) if (left_prob and left_prob > self.threshold) else (0, 0, 255)
+            right_color = (0, 255, 0) if (right_prob and right_prob > self.threshold) else (0, 0, 255)
 
-            # Add padding
-            pad = int((fx2 - fx1) * 0.4)
-            fx1, fy1 = max(0, fx1 - pad), max(0, fy1 - pad)
-            fx2, fy2 = min(w, fx2 + pad), min(h, fy2 + pad)
+            cv2.rectangle(display, (left_box[0], left_box[1]), (left_box[2], left_box[3]), left_color, 2)
+            cv2.rectangle(display, (right_box[0], right_box[1]), (right_box[2], right_box[3]), right_color, 2)
 
-            # Display eye crops and calculate adjusted boxes
-            adj_left_box, adj_right_box = None, None
-            left_color, right_color = (0, 255, 0), (0, 255, 0)
-
-            if left_crop is not None:
-                left_color = (0, 255, 0) if (left_prob and left_prob > self.threshold) else (0, 0, 255)
-                adj_left_box = (left_box[0] - fx1, left_box[1] - fy1, left_box[2] - fx1, left_box[3] - fy1)
-                self._show_crop(left_crop, self.left_canvas)
-
-            if right_crop is not None:
-                right_color = (0, 255, 0) if (right_prob and right_prob > self.threshold) else (0, 0, 255)
-                adj_right_box = (right_box[0] - fx1, right_box[1] - fy1, right_box[2] - fx1, right_box[3] - fy1)
-                self._show_crop(right_crop, self.right_canvas)
-
-            # Zoom to face region
-            display = display[fy1:fy2, fx1:fx2].copy()
-
-            # Draw rectangles on zoomed display
-            if adj_left_box is not None:
-                cv2.rectangle(display, (adj_left_box[0], adj_left_box[1]), (adj_left_box[2], adj_left_box[3]), left_color, 2)
-            if adj_right_box is not None:
-                cv2.rectangle(display, (adj_right_box[0], adj_right_box[1]), (adj_right_box[2], adj_right_box[3]), right_color, 2)
+            # Show crops
+            self._show_crop(left_crop, self.left_canvas)
+            self._show_crop(right_crop, self.right_canvas)
 
             # Update labels
             self._update_eye_label(self.left_var, self.left_label, left_prob)
             self._update_eye_label(self.right_var, self.right_label, right_prob)
             self._update_status(left_prob, right_prob)
         else:
-            self.status_var.set("No face detected")
+            self.status_var.set("No eyes detected")
             self.status_label.config(foreground="gray")
-            self.ear_var.set("EAR: --")
             self.left_var.set("--")
             self.right_var.set("--")
+
+        # Zoom to face if detected
+        if face_box:
+            pad = int((face_box[2] - face_box[0]) * 0.3)
+            fx1 = max(0, face_box[0] - pad)
+            fy1 = max(0, face_box[1] - pad)
+            fx2 = min(w, face_box[2] + pad)
+            fy2 = min(h, face_box[3] + pad)
+            display = display[fy1:fy2, fx1:fx2]
 
         self._show_frame(display)
         self.root.after(15, self._update)
@@ -560,7 +346,6 @@ class EyeDetectorGUI:
             self.status_label.config(foreground="gray")
             return
 
-        # Use average or single eye
         if left_prob is not None and right_prob is not None:
             avg = (left_prob + right_prob) / 2
         else:
@@ -599,8 +384,6 @@ class EyeDetectorGUI:
         self.running = False
         if self.cap:
             self.cap.release()
-        if hasattr(self, "landmarker"):
-            self.landmarker.close()
         self.root.destroy()
 
 
