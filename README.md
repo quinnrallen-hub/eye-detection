@@ -21,11 +21,6 @@ pip install opencv-python numpy pillow torch
 python gui.py
 ```
 
-For MediaPipe version (more accurate eye tracking):
-```bash
-pip install mediapipe
-python gui_mediapipe.py
-```
 
 ### ESP32-CAM Setup
 
@@ -35,8 +30,6 @@ python gui_mediapipe.py
 4. Enter the IP in the GUI and click "Connect ESP"
 
 ## How It Works
-
-Uses MediaPipe FaceLandmarker to detect 468 facial landmarks, then calculates Eye Aspect Ratio (EAR) for each eye:
 
 ```
 EAR = (|p2-p6| + |p3-p5|) / (2 * |p1-p4|)
