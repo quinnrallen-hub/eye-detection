@@ -7,16 +7,19 @@ Uses MediaPipe FaceLandmarker to find eyes, CNN to classify open/closed.
 import tkinter as tk
 from tkinter import ttk
 import cv2
-import torch
-import torch.nn as nn
 import numpy as np
 from PIL import Image, ImageTk
 import mediapipe as mp
+import onnxruntime as ort
 
 # --- Config ---
-IMG_SIZE = 64
-MODEL_PATH = "/home/quinn/eye_detection_project/eye_classifier.pth"
+IMG_SIZE = 96
+ONNX_PATH = "/home/quinn/ai_training_mats/eye_model/eyes_open_closed_v2.onnx"
 LANDMARKER_PATH = "/home/quinn/eye_detection_project/face_landmarker.task"
+
+# ImageNet normalization
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 # ESP32-CAM stream URL (change IP to match your camera)
 ESPCAM_URL = "http://192.168.251.119:81/stream"
@@ -36,33 +39,6 @@ EAR_THRESHOLD = 0.22
 PADDING = 0.4
 
 
-class EyeCNN(nn.Module):
-    """Simple CNN for eye open/closed classification."""
-    def __init__(self):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-        )
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128 * 8 * 8, 256),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, 2),
-        )
-
-    def forward(self, x):
-        return self.classifier(self.features(x))
-
-
 class EyeDetectorGUI:
     def __init__(self, root):
         self.root = root
@@ -75,10 +51,12 @@ class EyeDetectorGUI:
         self.current_cam = 0
         self.available_cameras = []
         self.threshold = 0.5
+        self.frame_count = 0
+        self.last_left_prob = None
+        self.last_right_prob = None
 
         # Load models
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = self._load_model()
+        self.session = self._load_onnx()
         self.landmarker = self._load_landmarker()
 
         # Build UI
@@ -88,11 +66,8 @@ class EyeDetectorGUI:
         self._detect_cameras()
         self._start_stream()
 
-    def _load_model(self):
-        model = EyeCNN().to(self.device)
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=self.device, weights_only=True))
-        model.eval()
-        return model
+    def _load_onnx(self):
+        return ort.InferenceSession(ONNX_PATH, providers=['CPUExecutionProvider'])
 
     def _load_landmarker(self):
         options = mp.tasks.vision.FaceLandmarkerOptions(
@@ -321,6 +296,35 @@ class EyeDetectorGUI:
             # Linear interpolation between 0.15 and 0.30
             return (ear_value - 0.15) / 0.15
 
+    def _predict_cnn(self, crop):
+        """Use ONNX model to predict if eye is open. Returns open probability."""
+        if crop is None or crop.size == 0:
+            return None
+
+        h, w = crop.shape[:2]
+        if h < 10 or w < 10:
+            return None
+
+        try:
+            # Preprocess: RGB, resize, normalize with ImageNet stats
+            img = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+            img = img.astype(np.float32) / 255.0
+            img = (img - IMAGENET_MEAN) / IMAGENET_STD
+            img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
+            img = np.expand_dims(img, 0)  # Add batch dim
+
+            # Run ONNX inference
+            input_name = self.session.get_inputs()[0].name
+            output = self.session.run(None, {input_name: img})[0][0][0]
+
+            # Output is sigmoid already, >0.5 means closed
+            # Return open probability (1 - closed)
+            return 1.0 - float(output)
+        except Exception as e:
+            print(f"ONNX predict error: {e}")
+            return None
+
     def _get_brightness(self, frame):
         """Get average brightness of frame (0-255)."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -330,16 +334,17 @@ class EyeDetectorGUI:
         """Adjust threshold based on frame brightness."""
         brightness = self._get_brightness(frame)
 
-        # Bright (>150): use lower threshold (easier to detect)
-        # Dark (<80): use higher threshold (harder to detect)
-        # Map brightness 50-200 to threshold 0.6-0.4
-        if brightness > 200:
-            new_thresh = 0.40
-        elif brightness < 50:
-            new_thresh = 0.65
+        # More aggressive mapping:
+        # Very bright (>180): threshold 0.25 (very easy detection)
+        # Very dark (<40): threshold 0.80 (strict detection)
+        # Map brightness 40-180 to threshold 0.80-0.25
+        if brightness > 180:
+            new_thresh = 0.25
+        elif brightness < 40:
+            new_thresh = 0.80
         else:
             # Linear interpolation
-            new_thresh = 0.65 - (brightness - 50) * (0.25 / 150)
+            new_thresh = 0.80 - (brightness - 40) * (0.55 / 140)
 
         self.threshold = new_thresh
         self.thresh_var.set(new_thresh)
@@ -391,20 +396,47 @@ class EyeDetectorGUI:
             right_ear = self._compute_ear(lm, RIGHT_EYE_EAR)
             self.ear_var.set(f"EAR: L={left_ear:.2f} R={right_ear:.2f}")
 
-            # Use EAR for open/closed detection
-            left_prob = self._predict_ear(left_ear)
-            right_prob = self._predict_ear(right_ear)
-
-            # Crop and display eyes
+            # Get eye crops first for CNN prediction
             left_crop, left_box = self._crop_eye(frame, lm, LEFT_EYE_CONTOUR)
+            right_crop, right_box = self._crop_eye(frame, lm, RIGHT_EYE_CONTOUR)
+
+            # Use ONNX for prediction (faster than PyTorch)
+            left_prob = self._predict_cnn(left_crop)
+            right_prob = self._predict_cnn(right_crop)
+
+            # Get face bounding box for zoom
+            face_xs = [lm[i].x * w for i in range(len(lm))]
+            face_ys = [lm[i].y * h for i in range(len(lm))]
+            fx1, fx2 = int(min(face_xs)), int(max(face_xs))
+            fy1, fy2 = int(min(face_ys)), int(max(face_ys))
+
+            # Add padding
+            pad = int((fx2 - fx1) * 0.4)
+            fx1, fy1 = max(0, fx1 - pad), max(0, fy1 - pad)
+            fx2, fy2 = min(w, fx2 + pad), min(h, fy2 + pad)
+
+            # Display eye crops and calculate adjusted boxes
+            adj_left_box, adj_right_box = None, None
+            left_color, right_color = (0, 255, 0), (0, 255, 0)
+
             if left_crop is not None:
-                cv2.rectangle(display, (left_box[0], left_box[1]), (left_box[2], left_box[3]), (0, 255, 0), 2)
+                left_color = (0, 255, 0) if (left_prob and left_prob > self.threshold) else (0, 0, 255)
+                adj_left_box = (left_box[0] - fx1, left_box[1] - fy1, left_box[2] - fx1, left_box[3] - fy1)
                 self._show_crop(left_crop, self.left_canvas)
 
-            right_crop, right_box = self._crop_eye(frame, lm, RIGHT_EYE_CONTOUR)
             if right_crop is not None:
-                cv2.rectangle(display, (right_box[0], right_box[1]), (right_box[2], right_box[3]), (0, 255, 0), 2)
+                right_color = (0, 255, 0) if (right_prob and right_prob > self.threshold) else (0, 0, 255)
+                adj_right_box = (right_box[0] - fx1, right_box[1] - fy1, right_box[2] - fx1, right_box[3] - fy1)
                 self._show_crop(right_crop, self.right_canvas)
+
+            # Zoom to face region
+            display = display[fy1:fy2, fx1:fx2].copy()
+
+            # Draw rectangles on zoomed display
+            if adj_left_box is not None:
+                cv2.rectangle(display, (adj_left_box[0], adj_left_box[1]), (adj_left_box[2], adj_left_box[3]), left_color, 2)
+            if adj_right_box is not None:
+                cv2.rectangle(display, (adj_right_box[0], adj_right_box[1]), (adj_right_box[2], adj_right_box[3]), right_color, 2)
 
             # Update labels
             self._update_eye_label(self.left_var, self.left_label, left_prob)
