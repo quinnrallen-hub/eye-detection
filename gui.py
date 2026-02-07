@@ -77,6 +77,7 @@ class EyeDetectorGUI:
         self.last_right_prob = None
         self.inference_interval = 3
 
+
         # Load model
         self.model = self._load_model()
 
@@ -172,13 +173,15 @@ class EyeDetectorGUI:
         self.thresh_label.config(text=f"{self.threshold:.2f}")
 
     def _preprocess_crop(self, crop):
-        """Preprocess a single crop for CNN."""
+        """Preprocess a single crop for CNN with brightness normalization."""
         if crop is None or crop.size == 0:
             return None
         h, w = crop.shape[:2]
         if h < 10 or w < 10:
             return None
-        img = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        # Normalize brightness
+        img = self._normalize_brightness(crop)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
         img = img.astype(np.float32) / 255.0
         return torch.from_numpy(img).permute(2, 0, 1)
@@ -215,12 +218,27 @@ class EyeDetectorGUI:
             print(f"CNN predict error: {e}")
             return None, None
 
+    def _normalize_brightness(self, img):
+        """Normalize brightness using CLAHE for consistent detection."""
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        lab = cv2.merge([l, a, b])
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
     def _detect_eyes(self, frame):
         """Detect face and estimate eye positions. Returns list of eye boxes."""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Normalize brightness for better detection
+        normalized = self._normalize_brightness(frame)
+        gray = cv2.cvtColor(normalized, cv2.COLOR_BGR2GRAY)
 
-        # Detect faces
-        faces = FACE_CASCADE.detectMultiScale(gray, 1.3, 5)
+        # Try detecting face with lenient settings
+        faces = FACE_CASCADE.detectMultiScale(gray, 1.1, 3, minSize=(50, 50))
+
+        # If no face found, try even more lenient
+        if len(faces) == 0:
+            faces = FACE_CASCADE.detectMultiScale(gray, 1.05, 2, minSize=(40, 40))
 
         if len(faces) == 0:
             return [], None
@@ -254,8 +272,7 @@ class EyeDetectorGUI:
             min(frame.shape[0], eye_y + eye_h + pad)
         )
 
-        face_box = (fx, fy, fx + fw, fy + fh)
-        return [right_box, left_box], face_box
+        return [right_box, left_box]
 
     def _update(self):
         if not self.running:
@@ -274,7 +291,7 @@ class EyeDetectorGUI:
         display = frame.copy()
 
         # Detect eyes
-        eye_boxes, face_box = self._detect_eyes(frame)
+        eye_boxes = self._detect_eyes(frame)
 
         left_prob, right_prob = None, None
         left_crop, right_crop = None, None
@@ -296,10 +313,10 @@ class EyeDetectorGUI:
             left_prob = self.last_left_prob
             right_prob = self.last_right_prob
 
-            # Draw rectangles
             left_color = (0, 255, 0) if (left_prob and left_prob > self.threshold) else (0, 0, 255)
             right_color = (0, 255, 0) if (right_prob and right_prob > self.threshold) else (0, 0, 255)
 
+            # Draw boxes around eyes
             cv2.rectangle(display, (left_box[0], left_box[1]), (left_box[2], left_box[3]), left_color, 2)
             cv2.rectangle(display, (right_box[0], right_box[1]), (right_box[2], right_box[3]), right_color, 2)
 
@@ -316,15 +333,6 @@ class EyeDetectorGUI:
             self.status_label.config(foreground="gray")
             self.left_var.set("--")
             self.right_var.set("--")
-
-        # Zoom to face if detected
-        if face_box:
-            pad = int((face_box[2] - face_box[0]) * 0.3)
-            fx1 = max(0, face_box[0] - pad)
-            fy1 = max(0, face_box[1] - pad)
-            fx2 = min(w, face_box[2] + pad)
-            fy2 = min(h, face_box[3] + pad)
-            display = display[fy1:fy2, fx1:fx2]
 
         self._show_frame(display)
         self.root.after(15, self._update)
