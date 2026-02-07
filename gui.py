@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Eye open/closed detection GUI.
-Uses MediaPipe FaceLandmarker to find eyes, CNN to classify open/closed.
+Uses MediaPipe FaceLandmarker to find eyes, custom CNN to classify open/closed.
 """
 
 import tkinter as tk
@@ -10,16 +10,54 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 import mediapipe as mp
-import onnxruntime as ort
+import torch
+import torch.nn as nn
 
 # --- Config ---
-IMG_SIZE = 96
-ONNX_PATH = "/home/quinn/ai_training_mats/eye_model/eyes_open_closed_v2.onnx"
+IMG_SIZE = 64
+MODEL_PATH = "/home/quinn/eye_detection_project/eye_classifier.pth"
 LANDMARKER_PATH = "/home/quinn/eye_detection_project/face_landmarker.task"
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# ImageNet normalization
-IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+class EyeCNN(nn.Module):
+    """CNN with BatchNorm - must match training architecture."""
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(128, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(128, 2)
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
 
 # ESP32-CAM stream URL (change IP to match your camera)
 ESPCAM_URL = "http://192.168.251.119:81/stream"
@@ -54,9 +92,10 @@ class EyeDetectorGUI:
         self.frame_count = 0
         self.last_left_prob = None
         self.last_right_prob = None
+        self.inference_interval = 3  # Only run CNN every N frames
 
         # Load models
-        self.session = self._load_onnx()
+        self.model = self._load_model()
         self.landmarker = self._load_landmarker()
 
         # Build UI
@@ -66,8 +105,11 @@ class EyeDetectorGUI:
         self._detect_cameras()
         self._start_stream()
 
-    def _load_onnx(self):
-        return ort.InferenceSession(ONNX_PATH, providers=['CPUExecutionProvider'])
+    def _load_model(self):
+        model = EyeCNN().to(DEVICE)
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True))
+        model.eval()
+        return model
 
     def _load_landmarker(self):
         options = mp.tasks.vision.FaceLandmarkerOptions(
@@ -296,8 +338,53 @@ class EyeDetectorGUI:
             # Linear interpolation between 0.15 and 0.30
             return (ear_value - 0.15) / 0.15
 
+    def _preprocess_crop(self, crop):
+        """Preprocess a single crop for CNN."""
+        if crop is None or crop.size == 0:
+            return None
+        h, w = crop.shape[:2]
+        if h < 10 or w < 10:
+            return None
+        img = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+        img = img.astype(np.float32) / 255.0
+        return torch.from_numpy(img).permute(2, 0, 1)
+
+    def _predict_batch(self, left_crop, right_crop):
+        """Predict both eyes in a single batch for speed."""
+        left_tensor = self._preprocess_crop(left_crop)
+        right_tensor = self._preprocess_crop(right_crop)
+
+        if left_tensor is None and right_tensor is None:
+            return None, None
+
+        try:
+            # Build batch
+            tensors = []
+            left_idx, right_idx = -1, -1
+            if left_tensor is not None:
+                left_idx = len(tensors)
+                tensors.append(left_tensor)
+            if right_tensor is not None:
+                right_idx = len(tensors)
+                tensors.append(right_tensor)
+
+            batch = torch.stack(tensors).to(DEVICE)
+
+            with torch.no_grad():
+                output = self.model(batch)
+                probs = torch.softmax(output, dim=1)
+
+            left_prob = probs[left_idx, 0].item() if left_idx >= 0 else None
+            right_prob = probs[right_idx, 0].item() if right_idx >= 0 else None
+
+            return left_prob, right_prob
+        except Exception as e:
+            print(f"CNN predict error: {e}")
+            return None, None
+
     def _predict_cnn(self, crop):
-        """Use ONNX model to predict if eye is open. Returns open probability."""
+        """Use custom CNN to predict if eye is open. Returns open probability."""
         if crop is None or crop.size == 0:
             return None
 
@@ -306,23 +393,22 @@ class EyeDetectorGUI:
             return None
 
         try:
-            # Preprocess: RGB, resize, normalize with ImageNet stats
+            # Preprocess: RGB, resize, normalize to 0-1
             img = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
             img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
             img = img.astype(np.float32) / 255.0
-            img = (img - IMAGENET_MEAN) / IMAGENET_STD
-            img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
-            img = np.expand_dims(img, 0)  # Add batch dim
+            img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
 
-            # Run ONNX inference
-            input_name = self.session.get_inputs()[0].name
-            output = self.session.run(None, {input_name: img})[0][0][0]
+            # Run inference
+            with torch.no_grad():
+                output = self.model(img)
+                probs = torch.softmax(output, dim=1)
+                # Class 0 = open, Class 1 = closed
+                open_prob = probs[0, 0].item()
 
-            # Output is sigmoid already, >0.5 means closed
-            # Return open probability (1 - closed)
-            return 1.0 - float(output)
+            return open_prob
         except Exception as e:
-            print(f"ONNX predict error: {e}")
+            print(f"CNN predict error: {e}")
             return None
 
     def _get_brightness(self, frame):
@@ -396,13 +482,18 @@ class EyeDetectorGUI:
             right_ear = self._compute_ear(lm, RIGHT_EYE_EAR)
             self.ear_var.set(f"EAR: L={left_ear:.2f} R={right_ear:.2f}")
 
-            # Get eye crops first for CNN prediction
+            # Get eye crops for prediction
             left_crop, left_box = self._crop_eye(frame, lm, LEFT_EYE_CONTOUR)
             right_crop, right_box = self._crop_eye(frame, lm, RIGHT_EYE_CONTOUR)
 
-            # Use ONNX for prediction (faster than PyTorch)
-            left_prob = self._predict_cnn(left_crop)
-            right_prob = self._predict_cnn(right_crop)
+            # Only run CNN every N frames to reduce lag
+            self.frame_count += 1
+            if self.frame_count >= self.inference_interval:
+                self.frame_count = 0
+                self.last_left_prob, self.last_right_prob = self._predict_batch(left_crop, right_crop)
+
+            left_prob = self.last_left_prob
+            right_prob = self.last_right_prob
 
             # Get face bounding box for zoom
             face_xs = [lm[i].x * w for i in range(len(lm))]
@@ -450,7 +541,7 @@ class EyeDetectorGUI:
             self.right_var.set("--")
 
         self._show_frame(display)
-        self.root.after(30, self._update)
+        self.root.after(15, self._update)
 
     def _update_eye_label(self, var, label, prob):
         if prob is None:
