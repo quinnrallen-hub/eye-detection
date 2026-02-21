@@ -1,214 +1,231 @@
 #!/usr/bin/env python3
 """
 Eye open/closed detection GUI.
-Uses OpenCV Haar cascades for eye detection, custom CNN to classify open/closed.
-NO MediaPipe - only OpenCV + your trained model.
+MediaPipe Face Landmarker blendshapes → reliability-weighted blink score → alert.
+
+Signal pipeline:
+  eyeBlinkLeft / eyeBlinkRight blendshapes  (0 = open, 1 = closed)
+  → per-eye EMA smoothing  (slow to close, fast to open — blinks don't count)
+  → reliability-weighted combination  (eye with more observed range gets more weight)
+  → threshold → EYES OPEN / CLOSED status
+  → 2-second sustained-closure timer → alert
 """
 
 import tkinter as tk
+import tkinter.messagebox as mb
 from tkinter import ttk
+from collections import deque
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
-import torch
-import torch.nn as nn
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+import urllib.request
 import time
 import threading
 import requests
+from pathlib import Path
 
-# --- Config ---
-IMG_SIZE = 64
-MODEL_PATH = "/home/quinn/eye_detection_project/eye_classifier.pth"
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# ── Canvas ────────────────────────────────────────────────────────────────────
+VIDEO_W, VIDEO_H = 640, 400
+CROP_W,  CROP_H  = 120, 90
 
-# OpenCV Haar cascades (built into OpenCV)
-FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-EYE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+# ── MediaPipe ─────────────────────────────────────────────────────────────────
+MP_MODEL_PATH = str(Path(__file__).parent / "face_landmarker.task")
+MP_MODEL_URL  = ("https://storage.googleapis.com/mediapipe-models/"
+                 "face_landmarker/face_landmarker/float16/latest/face_landmarker.task")
+
+BLINK_LEFT  = "eyeBlinkLeft"   # 0 = open, 1 = closed  (subject's left  = image-right)
+BLINK_RIGHT = "eyeBlinkRight"  # 0 = open, 1 = closed  (subject's right = image-left)
+
+# Landmark indices for eye crop boxes and face oval overlay
+RIGHT_EYE_IDXS = [33,  7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
+LEFT_EYE_IDXS  = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+FACE_OVAL_IDXS = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365,
+                  379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172,  58, 132,  93,
+                  234, 127, 162,  21,  54, 103,  67, 109]
+
+# ── EMA ───────────────────────────────────────────────────────────────────────
+# Applied to the blink score (0=open → 1=closed).
+# Slow to rise (closing): brief blinks don't push the smoothed score above threshold.
+# Fast to fall  (opening): recovers immediately when eyes genuinely open.
+BLINK_EMA_RISE = 0.25   # alpha when score is going up   (eyes closing)
+BLINK_EMA_FALL = 0.80   # alpha when score is going down (eyes opening)
+
+# ── Reliability ───────────────────────────────────────────────────────────────
+# Each eye's weight = its observed range (max−min) over the history window.
+# An eye whose blendshape never varies gets weight ≈ 0.
+HIST_FRAMES = 90   # ~3 s at 30 fps
+
+# ── Alert timing ──────────────────────────────────────────────────────────────
+ALERT_AFTER_SECS     = 2.0
+FACE_CANCEL_SECS     = 3.0
+
+FPS_ALPHA = 0.1
 
 
-class EyeCNN(nn.Module):
-    """CNN with BatchNorm - must match training architecture."""
-    def __init__(self):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(128, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),
-        )
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(128, 2)
-        )
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.classifier(x)
-        return x
+def _blink_ema(new: float, old: float | None) -> float:
+    if old is None:
+        return new
+    alpha = BLINK_EMA_RISE if new > old else BLINK_EMA_FALL
+    return alpha * new + (1.0 - alpha) * old
 
 
 class EyeDetectorGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Eye Detector (No MediaPipe)")
-        self.root.geometry("800x650")
+        self.root.title("Eye Detector")
+        self.root.geometry("800x680")
 
-        # State
-        self.cap = None
-        self.running = False
-        self.threshold = 0.5
-        self.frame_count = 0
-        self.last_left_prob = None
-        self.last_right_prob = None
-        self.inference_interval = 3
-        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        self.last_face = None
-        self.last_time = time.time()
-        self.fps = 0
-        self.closed_since = None
-        self.alert_active = False
+        # ── Camera / runtime ──────────────────────────────────────────────────
+        self.cap            = None
+        self.running        = False
+        self.last_time      = time.time()
+        self.fps            = 0.0
 
-        # Load model
-        self.model = self._load_model()
+        # Blink threshold: eye is CLOSED when smoothed blink score > this value.
+        # Exposed via slider (0–1). Default 0.35 works for most people.
+        self.blink_threshold = 0.35
 
-        # Build UI
+        # ── Detection state ───────────────────────────────────────────────────
+        self.smooth_blink_l  = None   # smoothed blink score, subject's left eye
+        self.smooth_blink_r  = None   # smoothed blink score, subject's right eye
+        self._hist_l         = deque(maxlen=HIST_FRAMES)
+        self._hist_r         = deque(maxlen=HIST_FRAMES)
+        self.cached_eyes     = None
+        self.last_face       = None
+
+        # ── Alert state ───────────────────────────────────────────────────────
+        self.closed_since    = None
+        self.face_lost_since = None
+        self.alert_active    = False
+
+        # ── MediaPipe ─────────────────────────────────────────────────────────
+        if not Path(MP_MODEL_PATH).exists():
+            print("Downloading MediaPipe face landmarker model (~6 MB)…")
+            urllib.request.urlretrieve(MP_MODEL_URL, MP_MODEL_PATH)
+        self.face_mesh = mp_vision.FaceLandmarker.create_from_options(
+            mp_vision.FaceLandmarkerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=MP_MODEL_PATH),
+                running_mode=mp_vision.RunningMode.VIDEO,
+                num_faces=1,
+                min_face_detection_confidence=0.5,
+                min_face_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+                output_face_blendshapes=True,
+            )
+        )
+        self._mp_ts = 0
+
         self._setup_ui()
-
-        # Start
         self._start_stream()
 
-    def _load_model(self):
-        model = EyeCNN().to(DEVICE)
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True))
-        model.eval()
-        return model
+    # ── UI ────────────────────────────────────────────────────────────────────
 
     def _setup_ui(self):
         main = ttk.Frame(self.root, padding=10)
         main.pack(fill=tk.BOTH, expand=True)
 
-        # Camera selection
+        # Camera row
         top = ttk.Frame(main)
         top.pack(fill=tk.X, pady=5)
-
         ttk.Label(top, text="Camera:").pack(side=tk.LEFT, padx=5)
         self.cam_var = tk.IntVar(value=0)
         ttk.Spinbox(top, from_=0, to=4, textvariable=self.cam_var, width=5).pack(side=tk.LEFT, padx=5)
         ttk.Button(top, text="Switch", command=self._switch_camera).pack(side=tk.LEFT, padx=5)
 
-        # ESP32 config row
-        esp_row = ttk.Frame(main)
-        esp_row.pack(fill=tk.X, pady=2)
+        # ESP32-CAM row
+        esp = ttk.Frame(main)
+        esp.pack(fill=tk.X, pady=2)
+        ttk.Label(esp, text="ESP32-CAM URL:").pack(side=tk.LEFT, padx=5)
+        self.cam_url_var = tk.StringVar(value="http://192.168.x.x:81/stream")
+        ttk.Entry(esp, textvariable=self.cam_url_var, width=28).pack(side=tk.LEFT, padx=5)
+        ttk.Button(esp, text="Use ESP32-CAM", command=self._connect_esp_cam).pack(side=tk.LEFT, padx=5)
+        ttk.Label(esp, text="Alert IP:").pack(side=tk.LEFT, padx=15)
+        self.alert_ip_var = tk.StringVar(value="192.168.251.214")
+        ttk.Entry(esp, textvariable=self.alert_ip_var, width=16).pack(side=tk.LEFT, padx=5)
 
-        ttk.Label(esp_row, text="ESP32-CAM URL:").pack(side=tk.LEFT, padx=5)
-        self.cam_url_var = tk.StringVar(value="")
-        ttk.Entry(esp_row, textvariable=self.cam_url_var, width=28).pack(side=tk.LEFT, padx=5)
-        ttk.Button(esp_row, text="Use ESP32-CAM", command=self._connect_esp_cam).pack(side=tk.LEFT, padx=5)
-
-        ttk.Label(esp_row, text="Alert IP:").pack(side=tk.LEFT, padx=15)
-        self.alert_ip_var = tk.StringVar(value="")
-        ttk.Entry(esp_row, textvariable=self.alert_ip_var, width=16).pack(side=tk.LEFT, padx=5)
-
-        # Video display
-        self.video_canvas = tk.Canvas(main, width=640, height=400, bg="black")
+        # Video canvas
+        self.video_canvas = tk.Canvas(main, width=VIDEO_W, height=VIDEO_H, bg="black")
         self.video_canvas.pack(pady=10)
 
         # Eye crops
-        eye_frame = ttk.Frame(main)
-        eye_frame.pack(pady=5)
-
-        ttk.Label(eye_frame, text="Left Eye:").pack(side=tk.LEFT, padx=5)
-        self.left_canvas = tk.Canvas(eye_frame, width=120, height=90, bg="gray",
+        crops = ttk.Frame(main)
+        crops.pack(pady=5)
+        ttk.Label(crops, text="Left Eye:").pack(side=tk.LEFT, padx=5)
+        self.left_canvas = tk.Canvas(crops, width=CROP_W, height=CROP_H, bg="gray",
                                      highlightthickness=2, highlightbackground="gray")
         self.left_canvas.pack(side=tk.LEFT, padx=5)
-
-        ttk.Label(eye_frame, text="Right Eye:").pack(side=tk.LEFT, padx=20)
-        self.right_canvas = tk.Canvas(eye_frame, width=120, height=90, bg="gray",
+        ttk.Label(crops, text="Right Eye:").pack(side=tk.LEFT, padx=20)
+        self.right_canvas = tk.Canvas(crops, width=CROP_W, height=CROP_H, bg="gray",
                                       highlightthickness=2, highlightbackground="gray")
         self.right_canvas.pack(side=tk.LEFT, padx=5)
 
-        # Results
-        result_frame = ttk.Frame(main)
-        result_frame.pack(pady=10)
-
-        self.left_var = tk.StringVar(value="--")
-        self.left_label = ttk.Label(result_frame, textvariable=self.left_var, font=("Helvetica", 16, "bold"))
+        # Status labels
+        labels = ttk.Frame(main)
+        labels.pack(pady=10)
+        self.left_var   = tk.StringVar(value="--")
+        self.status_var = tk.StringVar(value="Starting…")
+        self.right_var  = tk.StringVar(value="--")
+        self.left_label   = ttk.Label(labels, textvariable=self.left_var,   font=("Helvetica", 16, "bold"))
+        self.status_label = ttk.Label(labels, textvariable=self.status_var, font=("Helvetica", 22, "bold"))
+        self.right_label  = ttk.Label(labels, textvariable=self.right_var,  font=("Helvetica", 16, "bold"))
         self.left_label.pack(side=tk.LEFT, padx=30)
-
-        self.status_var = tk.StringVar(value="Starting...")
-        self.status_label = ttk.Label(result_frame, textvariable=self.status_var, font=("Helvetica", 22, "bold"))
         self.status_label.pack(side=tk.LEFT, padx=30)
-
-        self.right_var = tk.StringVar(value="--")
-        self.right_label = ttk.Label(result_frame, textvariable=self.right_var, font=("Helvetica", 16, "bold"))
         self.right_label.pack(side=tk.LEFT, padx=30)
 
-        # Threshold slider
-        thresh_frame = ttk.Frame(main)
-        thresh_frame.pack(pady=10, fill=tk.X, padx=50)
-
-        ttk.Label(thresh_frame, text="Threshold:").pack(side=tk.LEFT, padx=5)
-        self.thresh_var = tk.DoubleVar(value=0.5)
-        self.thresh_slider = ttk.Scale(
-            thresh_frame, from_=0.0, to=1.0, variable=self.thresh_var,
-            orient=tk.HORIZONTAL, command=self._on_threshold_change
-        )
-        self.thresh_slider.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
-        self.thresh_label = ttk.Label(thresh_frame, text="0.50", width=5)
+        # Threshold slider  (controls blink score threshold, 0–1)
+        tf = ttk.Frame(main)
+        tf.pack(pady=10, fill=tk.X, padx=50)
+        ttk.Label(tf, text="Sensitivity:").pack(side=tk.LEFT, padx=5)
+        self.thresh_var = tk.DoubleVar(value=self.blink_threshold)
+        ttk.Scale(tf, from_=0.0, to=1.0, variable=self.thresh_var,
+                  orient=tk.HORIZONTAL,
+                  command=self._on_threshold_change).pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
+        self.thresh_label = ttk.Label(tf, text=f"{self.blink_threshold:.2f}", width=5)
         self.thresh_label.pack(side=tk.LEFT, padx=5)
+        ttk.Label(tf, text="← more sensitive    less sensitive →",
+                  foreground="gray").pack(side=tk.LEFT, padx=8)
+
+    # ── Camera helpers ────────────────────────────────────────────────────────
+
+    def _reset_state(self):
+        self.smooth_blink_l  = None
+        self.smooth_blink_r  = None
+        self._hist_l.clear()
+        self._hist_r.clear()
+        self.cached_eyes     = None
+        self.closed_since    = None
+        self.face_lost_since = None
+        self._mp_ts          = 0
+        if self.alert_active:
+            self.alert_active = False
+            self._send_alert(False)
+
+    def _open_camera(self, source):
+        if self.cap:
+            self.cap.release()
+        self._reset_state()
+        self.cap = cv2.VideoCapture(source)
+        if not self.cap.isOpened():
+            self.status_var.set("Cannot open camera")
+            self.status_label.config(foreground="red")
+            return
+        if not self.running:
+            self.running = True
+            self._update()
 
     def _connect_esp_cam(self):
         url = self.cam_url_var.get().strip()
-        if not url:
+        if not url or url == "http://192.168.x.x:81/stream":
+            self.status_var.set("Enter ESP32-CAM URL first")
+            self.status_label.config(foreground="orange")
             return
-        if self.cap:
-            self.cap.release()
-        self.last_left_prob = None
-        self.last_right_prob = None
-        self.cap = cv2.VideoCapture(url)
-        if not self.running:
-            self.running = True
-            self._update()
-
-    def _send_alert(self, on: bool):
-        ip = self.alert_ip_var.get().strip()
-        if not ip:
-            return
-        url = f"http://{ip}/alert/{'on' if on else 'off'}"
-        def _req():
-            try:
-                requests.get(url, timeout=1)
-            except Exception:
-                pass
-        threading.Thread(target=_req, daemon=True).start()
+        self._open_camera(url)
 
     def _switch_camera(self):
-        if self.cap:
-            self.cap.release()
-        self.last_left_prob = None
-        self.last_right_prob = None
-        self.cap = cv2.VideoCapture(self.cam_var.get())
-        if not self.running:
-            self.running = True
-            self._update()
+        self._open_camera(self.cam_var.get())
 
     def _start_stream(self):
         self.cap = cv2.VideoCapture(0)
@@ -219,113 +236,119 @@ class EyeDetectorGUI:
             self.status_var.set("No camera found")
 
     def _on_threshold_change(self, value):
-        self.threshold = float(value)
-        self.thresh_label.config(text=f"{self.threshold:.2f}")
+        self.blink_threshold = float(value)
+        self.thresh_label.config(text=f"{self.blink_threshold:.2f}")
 
-    def _preprocess_crop(self, crop):
-        """Preprocess a single crop for CNN with brightness normalization."""
+    # ── Alert ─────────────────────────────────────────────────────────────────
+
+    def _send_alert(self, on: bool):
+        ip = self.alert_ip_var.get().strip()
+        if not ip:
+            return
+        url = f"http://{ip}/alert/{'on' if on else 'off'}"
+        threading.Thread(
+            target=lambda: requests.get(url, timeout=1),
+            daemon=True
+        ).start()
+
+    # ── MediaPipe ─────────────────────────────────────────────────────────────
+
+    def _run_mediapipe(self, frame):
+        """Return (eye_boxes, blink_l, blink_r) or ([], None, None) if no face."""
+        h, w = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        self._mp_ts += 1
+        results = self.face_mesh.detect_for_video(
+            mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb),
+            self._mp_ts,
+        )
+
+        if not results.face_landmarks or not results.face_blendshapes:
+            self.last_face   = None
+            self.cached_eyes = None
+            return [], None, None
+
+        lm = results.face_landmarks[0]
+
+        # Blink scores
+        blink_l = blink_r = None
+        for cat in results.face_blendshapes[0]:
+            if   cat.category_name == BLINK_LEFT:  blink_l = cat.score
+            elif cat.category_name == BLINK_RIGHT:  blink_r = cat.score
+
+        # Face oval for overlay
+        oxs = [lm[i].x * w for i in FACE_OVAL_IDXS]
+        oys = [lm[i].y * h for i in FACE_OVAL_IDXS]
+        fx, fy = int(min(oxs)), int(min(oys))
+        self.last_face = (fx, fy, int(max(oxs)) - fx, int(max(oys)) - fy)
+
+        # Eye crop boxes  (generous padding so the CNN can be retrained later)
+        def _box(idxs, pad=0.6):
+            xs = [lm[i].x * w for i in idxs]
+            ys = [lm[i].y * h for i in idxs]
+            x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+            ew, eh = x2 - x1, y2 - y1
+            return (max(0, int(x1 - ew * pad)), max(0, int(y1 - eh * pad)),
+                    min(w, int(x2 + ew * pad)), min(h, int(y2 + eh * pad)))
+
+        # eye_boxes[0] = subject's right (image-left)  → right_box in _update
+        # eye_boxes[1] = subject's left  (image-right) → left_box  in _update
+        new_eyes = [_box(RIGHT_EYE_IDXS), _box(LEFT_EYE_IDXS)]
+        EMA = 0.3
+        if self.cached_eyes is None:
+            self.cached_eyes = new_eyes
+        else:
+            self.cached_eyes = [
+                tuple(int(EMA * n + (1 - EMA) * o) for n, o in zip(ne, oe))
+                for ne, oe in zip(new_eyes, self.cached_eyes)
+            ]
+
+        return self.cached_eyes, blink_l, blink_r
+
+    # ── Reliability weighting ────────────────────────────────────────────────
+
+    def _weights(self):
+        """Weight each eye by its observed blink-score range. Falls back to 0.5/0.5."""
+        if len(self._hist_l) < 10:
+            return 0.5, 0.5
+        rl = max(self._hist_l) - min(self._hist_l)
+        rr = max(self._hist_r) - min(self._hist_r)
+        total = rl + rr
+        if total < 1e-4:          # both stuck — equal weight
+            return 0.5, 0.5
+        return rl / total, rr / total
+
+    # ── Drawing helpers ───────────────────────────────────────────────────────
+
+    def _corner_box(self, img, x1, y1, x2, y2, color, thick=2, arm=14):
+        for sx, sy, dx, dy in [(x1,y1,1,1),(x2,y1,-1,1),(x1,y2,1,-1),(x2,y2,-1,-1)]:
+            cv2.line(img, (sx, sy), (sx + dx * arm, sy),        color, thick)
+            cv2.line(img, (sx, sy), (sx, sy + dy * arm),        color, thick)
+
+    def _show_crop(self, crop, canvas):
         if crop is None or crop.size == 0:
-            return None
-        h, w = crop.shape[:2]
-        if h < 10 or w < 10:
-            return None
-        # Normalize brightness
-        img = self._normalize_brightness(crop)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
-        img = img.astype(np.float32) / 255.0
-        return torch.from_numpy(img).permute(2, 0, 1)
+            return
+        rgb = cv2.resize(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB), (CROP_W, CROP_H))
+        img = ImageTk.PhotoImage(Image.fromarray(rgb))
+        canvas.delete("all")
+        canvas.create_image(CROP_W // 2, CROP_H // 2, image=img)
+        canvas.image = img
 
-    def _predict_batch(self, left_crop, right_crop):
-        """Predict both eyes in a single batch for speed."""
-        left_tensor = self._preprocess_crop(left_crop)
-        right_tensor = self._preprocess_crop(right_crop)
+    def _show_frame(self, frame):
+        h, w = frame.shape[:2]
+        scale = min(VIDEO_W / w, VIDEO_H / h)
+        rgb = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                         (int(w * scale), int(h * scale)))
+        img = ImageTk.PhotoImage(Image.fromarray(rgb))
+        self.video_canvas.delete("all")
+        self.video_canvas.create_image(VIDEO_W // 2, VIDEO_H // 2, image=img)
+        self.video_canvas.image = img
 
-        if left_tensor is None and right_tensor is None:
-            return None, None
-
-        try:
-            tensors = []
-            indices = {}
-            if left_tensor is not None:
-                indices['left'] = len(tensors)
-                tensors.append(left_tensor)
-            if right_tensor is not None:
-                indices['right'] = len(tensors)
-                tensors.append(right_tensor)
-
-            batch = torch.stack(tensors).to(DEVICE)
-
-            with torch.no_grad():
-                output = self.model(batch)
-                probs = torch.softmax(output, dim=1)
-
-            left_prob = probs[indices['left'], 0].item() if 'left' in indices else None
-            right_prob = probs[indices['right'], 0].item() if 'right' in indices else None
-
-            return left_prob, right_prob
-        except Exception as e:
-            print(f"CNN predict error: {e}")
-            return None, None
-
-    def _normalize_brightness(self, img):
-        """Normalize brightness using CLAHE for consistent detection."""
-        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        l = self.clahe.apply(l)
-        lab = cv2.merge([l, a, b])
-        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-    def _draw_corner_box(self, img, x1, y1, x2, y2, color, thickness=2, length=12):
-        """Draw corner-bracket style box instead of a plain rectangle."""
-        for (sx, sy, dx, dy) in [
-            (x1, y1,  1,  1),
-            (x2, y1, -1,  1),
-            (x1, y2,  1, -1),
-            (x2, y2, -1, -1),
-        ]:
-            cv2.line(img, (sx, sy), (sx + dx * length, sy), color, thickness)
-            cv2.line(img, (sx, sy), (sx, sy + dy * length), color, thickness)
-
-    def _detect_eyes(self, frame):
-        """Detect face and estimate eye positions. Returns list of eye boxes."""
-        normalized = self._normalize_brightness(frame)
-        gray = cv2.cvtColor(normalized, cv2.COLOR_BGR2GRAY)
-
-        faces = FACE_CASCADE.detectMultiScale(gray, 1.1, 3, minSize=(50, 50))
-        if len(faces) == 0:
-            faces = FACE_CASCADE.detectMultiScale(gray, 1.05, 2, minSize=(40, 40))
-        if len(faces) == 0:
-            self.last_face = None
-            return []
-
-        fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
-        self.last_face = (fx, fy, fw, fh)
-
-        eye_h = int(fh * 0.12)
-        eye_w = int(fw * 0.20)
-        eye_y = fy + int(fh * 0.36)
-        right_eye_x = fx + int(fw * 0.20)
-        left_eye_x  = fx + int(fw * 0.63)
-        pad = int(eye_w * 0.2)
-        right_box = (
-            max(0, right_eye_x - pad),
-            max(0, eye_y - pad),
-            min(frame.shape[1], right_eye_x + eye_w + pad),
-            min(frame.shape[0], eye_y + eye_h + pad)
-        )
-        left_box = (
-            max(0, left_eye_x - pad),
-            max(0, eye_y - pad),
-            min(frame.shape[1], left_eye_x + eye_w + pad),
-            min(frame.shape[0], eye_y + eye_h + pad)
-        )
-        return [right_box, left_box]
+    # ── Main loop ─────────────────────────────────────────────────────────────
 
     def _update(self):
         if not self.running:
             return
-
         if not self.cap or not self.cap.isOpened():
             self.root.after(30, self._update)
             return
@@ -337,106 +360,101 @@ class EyeDetectorGUI:
                 self.status_label.config(foreground="gray")
                 return
 
-            # FPS
             now = time.time()
-            self.fps = 1.0 / max(now - self.last_time, 0.001)
+            self.fps = FPS_ALPHA * (1.0 / max(now - self.last_time, 0.001)) + (1 - FPS_ALPHA) * self.fps
             self.last_time = now
 
             display = frame.copy()
-
-            # Detect eyes
-            eye_boxes = self._detect_eyes(frame)
-
-            left_prob, right_prob = None, None
-            left_crop, right_crop = None, None
+            eye_boxes, blink_l, blink_r = self._run_mediapipe(frame)
 
             if len(eye_boxes) == 2:
-                right_box = eye_boxes[0]
-                left_box = eye_boxes[1]
+                self.face_lost_since = None
+                right_box, left_box  = eye_boxes[0], eye_boxes[1]
 
                 right_crop = frame[right_box[1]:right_box[3], right_box[0]:right_box[2]]
-                left_crop = frame[left_box[1]:left_box[3], left_box[0]:left_box[2]]
+                left_crop  = frame[left_box[1]:left_box[3],   left_box[0]:left_box[2]]
 
-                # Run CNN every N frames
-                self.frame_count += 1
-                if self.frame_count >= self.inference_interval:
-                    self.frame_count = 0
-                    self.last_left_prob, self.last_right_prob = self._predict_batch(left_crop, right_crop)
+                # Smooth each eye's blink score independently
+                if blink_l is not None:
+                    self.smooth_blink_l = _blink_ema(blink_l, self.smooth_blink_l)
+                    self._hist_l.append(self.smooth_blink_l)
+                if blink_r is not None:
+                    self.smooth_blink_r = _blink_ema(blink_r, self.smooth_blink_r)
+                    self._hist_r.append(self.smooth_blink_r)
 
-                left_prob = self.last_left_prob
-                right_prob = self.last_right_prob
+                # Reliability-weighted combined blink score
+                w_l, w_r = self._weights()
+                bl = self.smooth_blink_l or 0.0
+                br = self.smooth_blink_r or 0.0
+                combined_blink = w_l * bl + w_r * br
 
-                left_color  = (0, 255, 0) if (left_prob  and left_prob  > self.threshold) else (0, 0, 255)
-                right_color = (0, 255, 0) if (right_prob and right_prob > self.threshold) else (0, 0, 255)
+                # Per-eye open/closed for labels and box colour
+                l_closed = bl > self.blink_threshold
+                r_closed = br > self.blink_threshold
+                eyes_closed = combined_blink > self.blink_threshold
 
-                # Draw face box (subtle white)
+                left_color  = (0, 0, 255) if l_closed else (0, 255, 0)
+                right_color = (0, 0, 255) if r_closed else (0, 255, 0)
+
+                # Face overlay
                 if self.last_face:
                     fx, fy, fw, fh = self.last_face
-                    self._draw_corner_box(display, fx, fy, fx + fw, fy + fh, (200, 200, 200), thickness=1, length=16)
+                    self._corner_box(display, fx, fy, fx+fw, fy+fh, (200,200,200), 1, 16)
 
-                # Draw corner-bracket boxes around eyes
-                self._draw_corner_box(display, left_box[0],  left_box[1],  left_box[2],  left_box[3],  left_color)
-                self._draw_corner_box(display, right_box[0], right_box[1], right_box[2], right_box[3], right_color)
+                self._corner_box(display, *left_box,  left_color)
+                self._corner_box(display, *right_box, right_color)
 
-                # Show crops with colored borders
                 self._show_crop(left_crop,  self.left_canvas)
                 self._show_crop(right_crop, self.right_canvas)
-                self.left_canvas.config(highlightbackground="green" if (left_prob and left_prob > self.threshold) else "red")
-                self.right_canvas.config(highlightbackground="green" if (right_prob and right_prob > self.threshold) else "red")
+                self.left_canvas.config(highlightbackground="red" if l_closed else "green")
+                self.right_canvas.config(highlightbackground="red" if r_closed else "green")
 
-                # Update labels
-                self._update_eye_label(self.left_var,  self.left_label,  left_prob)
-                self._update_eye_label(self.right_var, self.right_label, right_prob)
-                self._update_status(left_prob, right_prob)
+                # Labels: show blink score so user can see raw values
+                self.left_var.set(f"{'CLOSED' if l_closed else 'OPEN'} ({bl:.2f})")
+                self.left_label.config(foreground="red" if l_closed else "green")
+                self.right_var.set(f"{'CLOSED' if r_closed else 'OPEN'} ({br:.2f})")
+                self.right_label.config(foreground="red" if r_closed else "green")
+
+                self._update_status(eyes_closed)
+
             else:
-                self.last_left_prob = None
-                self.last_right_prob = None
+                # No face
+                self.smooth_blink_l = self.smooth_blink_r = None
                 self.status_var.set("No face detected")
                 self.status_label.config(foreground="gray")
-                self.left_var.set("--")
-                self.right_var.set("--")
+                self.left_var.set("--");  self.right_var.set("--")
                 self.left_canvas.config(highlightbackground="gray")
                 self.right_canvas.config(highlightbackground="gray")
 
-            # FPS overlay
-            cv2.putText(display, f"FPS: {self.fps:.0f}", (8, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+                if self.face_lost_since is None:
+                    self.face_lost_since = time.time()
+                if time.time() - self.face_lost_since > FACE_CANCEL_SECS:
+                    self.closed_since = None
+                    if self.alert_active:
+                        self.alert_active = False
+                        self._send_alert(False)
+
+            # Debug overlay
+            w_l, w_r = self._weights()
+            lines = [
+                f"FPS {self.fps:.0f}",
+                f"blink L:{self.smooth_blink_l:.2f}  R:{self.smooth_blink_r:.2f}"
+                    if self.smooth_blink_l is not None else "blink --",
+                f"weight L:{w_l:.2f}  R:{w_r:.2f}",
+            ]
+            for i, ln in enumerate(lines):
+                cv2.putText(display, ln, (8, 22 + i * 22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
 
             self._show_frame(display)
+
         except Exception as e:
             print(f"Frame error: {e}")
         finally:
             self.root.after(15, self._update)
 
-    def _update_eye_label(self, var, label, prob):
-        if prob is None:
-            var.set("--")
-            label.config(foreground="gray")
-        elif prob > self.threshold:
-            var.set(f"OPEN ({prob:.2f})")
-            label.config(foreground="green")
-        else:
-            var.set(f"CLOSED ({prob:.2f})")
-            label.config(foreground="red")
-
-    def _update_status(self, left_prob, right_prob):
-        if left_prob is None and right_prob is None:
-            self.status_var.set("Detection failed")
-            self.status_label.config(foreground="gray")
-            self.closed_since = None
-            if self.alert_active:
-                self.alert_active = False
-                self._send_alert(False)
-            return
-
-        if left_prob is not None and right_prob is not None:
-            avg = (left_prob + right_prob) / 2
-        else:
-            avg = left_prob if left_prob is not None else right_prob
-
-        eyes_open = avg > self.threshold
-
-        if eyes_open:
+    def _update_status(self, eyes_closed: bool):
+        if not eyes_closed:
             self.status_var.set("EYES OPEN")
             self.status_label.config(foreground="green")
             self.closed_since = None
@@ -444,43 +462,19 @@ class EyeDetectorGUI:
                 self.alert_active = False
                 self._send_alert(False)
         else:
-            # Track how long eyes have been closed
             if self.closed_since is None:
                 self.closed_since = time.time()
-            closed_duration = time.time() - self.closed_since
-
-            if closed_duration >= 2.0:
-                secs = int(closed_duration)
-                self.status_var.set(f"EYES CLOSED ({secs}s)")
+            secs = time.time() - self.closed_since
+            if secs >= ALERT_AFTER_SECS:
+                self.status_var.set(f"EYES CLOSED ({int(secs)}s)")
                 if not self.alert_active:
                     self.alert_active = True
                     self._send_alert(True)
             else:
                 self.status_var.set("EYES CLOSED")
-
             self.status_label.config(foreground="red")
 
-    def _show_crop(self, crop, canvas):
-        if crop is None or crop.size == 0:
-            return
-        rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-        rgb = cv2.resize(rgb, (120, 90))
-        img = ImageTk.PhotoImage(Image.fromarray(rgb))
-        canvas.delete("all")
-        canvas.create_image(60, 45, image=img)
-        canvas.image = img
-
-    def _show_frame(self, frame):
-        h, w = frame.shape[:2]
-        scale = min(640 / w, 400 / h)
-        new_size = (int(w * scale), int(h * scale))
-
-        rgb = cv2.cvtColor(cv2.resize(frame, new_size), cv2.COLOR_BGR2RGB)
-        img = ImageTk.PhotoImage(Image.fromarray(rgb))
-
-        self.video_canvas.delete("all")
-        self.video_canvas.create_image(320, 200, image=img)
-        self.video_canvas.image = img
+    # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def on_close(self):
         self.running = False
@@ -488,12 +482,18 @@ class EyeDetectorGUI:
             self._send_alert(False)
         if self.cap:
             self.cap.release()
+        self.face_mesh.close()
         self.root.destroy()
 
 
 def main():
     root = tk.Tk()
-    app = EyeDetectorGUI(root)
+    try:
+        app = EyeDetectorGUI(root)
+    except Exception as e:
+        mb.showerror("Startup Error", str(e))
+        root.destroy()
+        return
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()
 
