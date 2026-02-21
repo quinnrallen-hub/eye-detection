@@ -12,6 +12,7 @@ import numpy as np
 from PIL import Image, ImageTk
 import torch
 import torch.nn as nn
+import time
 
 # --- Config ---
 IMG_SIZE = 64
@@ -76,7 +77,10 @@ class EyeDetectorGUI:
         self.last_left_prob = None
         self.last_right_prob = None
         self.inference_interval = 3
-
+        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        self.last_face = None
+        self.last_time = time.time()
+        self.fps = 0
 
         # Load model
         self.model = self._load_model()
@@ -115,11 +119,13 @@ class EyeDetectorGUI:
         eye_frame.pack(pady=5)
 
         ttk.Label(eye_frame, text="Left Eye:").pack(side=tk.LEFT, padx=5)
-        self.left_canvas = tk.Canvas(eye_frame, width=80, height=60, bg="gray")
+        self.left_canvas = tk.Canvas(eye_frame, width=120, height=90, bg="gray",
+                                     highlightthickness=2, highlightbackground="gray")
         self.left_canvas.pack(side=tk.LEFT, padx=5)
 
         ttk.Label(eye_frame, text="Right Eye:").pack(side=tk.LEFT, padx=20)
-        self.right_canvas = tk.Canvas(eye_frame, width=80, height=60, bg="gray")
+        self.right_canvas = tk.Canvas(eye_frame, width=120, height=90, bg="gray",
+                                      highlightthickness=2, highlightbackground="gray")
         self.right_canvas.pack(side=tk.LEFT, padx=5)
 
         # Results
@@ -155,6 +161,8 @@ class EyeDetectorGUI:
     def _switch_camera(self):
         if self.cap:
             self.cap.release()
+        self.last_left_prob = None
+        self.last_right_prob = None
         self.cap = cv2.VideoCapture(self.cam_var.get())
         if not self.running:
             self.running = True
@@ -196,12 +204,12 @@ class EyeDetectorGUI:
 
         try:
             tensors = []
-            left_idx, right_idx = -1, -1
+            indices = {}
             if left_tensor is not None:
-                left_idx = len(tensors)
+                indices['left'] = len(tensors)
                 tensors.append(left_tensor)
             if right_tensor is not None:
-                right_idx = len(tensors)
+                indices['right'] = len(tensors)
                 tensors.append(right_tensor)
 
             batch = torch.stack(tensors).to(DEVICE)
@@ -210,8 +218,8 @@ class EyeDetectorGUI:
                 output = self.model(batch)
                 probs = torch.softmax(output, dim=1)
 
-            left_prob = probs[left_idx, 0].item() if left_idx >= 0 else None
-            right_prob = probs[right_idx, 0].item() if right_idx >= 0 else None
+            left_prob = probs[indices['left'], 0].item() if 'left' in indices else None
+            right_prob = probs[indices['right'], 0].item() if 'right' in indices else None
 
             return left_prob, right_prob
         except Exception as e:
@@ -222,42 +230,41 @@ class EyeDetectorGUI:
         """Normalize brightness using CLAHE for consistent detection."""
         lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        l = clahe.apply(l)
+        l = self.clahe.apply(l)
         lab = cv2.merge([l, a, b])
         return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
+    def _draw_corner_box(self, img, x1, y1, x2, y2, color, thickness=2, length=12):
+        """Draw corner-bracket style box instead of a plain rectangle."""
+        for (sx, sy, dx, dy) in [
+            (x1, y1,  1,  1),
+            (x2, y1, -1,  1),
+            (x1, y2,  1, -1),
+            (x2, y2, -1, -1),
+        ]:
+            cv2.line(img, (sx, sy), (sx + dx * length, sy), color, thickness)
+            cv2.line(img, (sx, sy), (sx, sy + dy * length), color, thickness)
+
     def _detect_eyes(self, frame):
         """Detect face and estimate eye positions. Returns list of eye boxes."""
-        # Normalize brightness for better detection
         normalized = self._normalize_brightness(frame)
         gray = cv2.cvtColor(normalized, cv2.COLOR_BGR2GRAY)
 
-        # Try detecting face with lenient settings
         faces = FACE_CASCADE.detectMultiScale(gray, 1.1, 3, minSize=(50, 50))
-
-        # If no face found, try even more lenient
         if len(faces) == 0:
             faces = FACE_CASCADE.detectMultiScale(gray, 1.05, 2, minSize=(40, 40))
-
         if len(faces) == 0:
-            return [], None
+            self.last_face = None
+            return []
 
-        # Use largest face
         fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+        self.last_face = (fx, fy, fw, fh)
 
-        # Estimate eye positions based on face proportions
-        # Eyes are about 40% down from top of face, smaller boxes
-        eye_h = int(fh * 0.12)  # Eye height (smaller)
-        eye_w = int(fw * 0.20)  # Eye width (smaller)
-        eye_y = fy + int(fh * 0.35)  # Eyes at 35% down from top
-
-        # Right eye (left side of image) - note: from camera's perspective
-        right_eye_x = fx + int(fw * 0.18)
-        # Left eye (right side of image)
-        left_eye_x = fx + int(fw * 0.62)
-
-        # Create eye boxes with small padding
+        eye_h = int(fh * 0.12)
+        eye_w = int(fw * 0.20)
+        eye_y = fy + int(fh * 0.36)
+        right_eye_x = fx + int(fw * 0.20)
+        left_eye_x  = fx + int(fw * 0.63)
         pad = int(eye_w * 0.2)
         right_box = (
             max(0, right_eye_x - pad),
@@ -271,7 +278,6 @@ class EyeDetectorGUI:
             min(frame.shape[1], left_eye_x + eye_w + pad),
             min(frame.shape[0], eye_y + eye_h + pad)
         )
-
         return [right_box, left_box]
 
     def _update(self):
@@ -282,60 +288,83 @@ class EyeDetectorGUI:
             self.root.after(30, self._update)
             return
 
-        ret, frame = self.cap.read()
-        if not ret:
-            self.root.after(30, self._update)
-            return
+        try:
+            ret, frame = self.cap.read()
+            if not ret:
+                self.status_var.set("Camera read failed")
+                self.status_label.config(foreground="gray")
+                return
 
-        h, w = frame.shape[:2]
-        display = frame.copy()
+            # FPS
+            now = time.time()
+            self.fps = 1.0 / max(now - self.last_time, 0.001)
+            self.last_time = now
 
-        # Detect eyes
-        eye_boxes = self._detect_eyes(frame)
+            display = frame.copy()
 
-        left_prob, right_prob = None, None
-        left_crop, right_crop = None, None
+            # Detect eyes
+            eye_boxes = self._detect_eyes(frame)
 
-        if len(eye_boxes) == 2:
-            # Eyes detected - right eye is first (left side of image)
-            right_box = eye_boxes[0]
-            left_box = eye_boxes[1]
+            left_prob, right_prob = None, None
+            left_crop, right_crop = None, None
 
-            right_crop = frame[right_box[1]:right_box[3], right_box[0]:right_box[2]]
-            left_crop = frame[left_box[1]:left_box[3], left_box[0]:left_box[2]]
+            if len(eye_boxes) == 2:
+                right_box = eye_boxes[0]
+                left_box = eye_boxes[1]
 
-            # Run CNN every N frames
-            self.frame_count += 1
-            if self.frame_count >= self.inference_interval:
-                self.frame_count = 0
-                self.last_left_prob, self.last_right_prob = self._predict_batch(left_crop, right_crop)
+                right_crop = frame[right_box[1]:right_box[3], right_box[0]:right_box[2]]
+                left_crop = frame[left_box[1]:left_box[3], left_box[0]:left_box[2]]
 
-            left_prob = self.last_left_prob
-            right_prob = self.last_right_prob
+                # Run CNN every N frames
+                self.frame_count += 1
+                if self.frame_count >= self.inference_interval:
+                    self.frame_count = 0
+                    self.last_left_prob, self.last_right_prob = self._predict_batch(left_crop, right_crop)
 
-            left_color = (0, 255, 0) if (left_prob and left_prob > self.threshold) else (0, 0, 255)
-            right_color = (0, 255, 0) if (right_prob and right_prob > self.threshold) else (0, 0, 255)
+                left_prob = self.last_left_prob
+                right_prob = self.last_right_prob
 
-            # Draw boxes around eyes
-            cv2.rectangle(display, (left_box[0], left_box[1]), (left_box[2], left_box[3]), left_color, 2)
-            cv2.rectangle(display, (right_box[0], right_box[1]), (right_box[2], right_box[3]), right_color, 2)
+                left_color  = (0, 255, 0) if (left_prob  and left_prob  > self.threshold) else (0, 0, 255)
+                right_color = (0, 255, 0) if (right_prob and right_prob > self.threshold) else (0, 0, 255)
 
-            # Show crops
-            self._show_crop(left_crop, self.left_canvas)
-            self._show_crop(right_crop, self.right_canvas)
+                # Draw face box (subtle white)
+                if self.last_face:
+                    fx, fy, fw, fh = self.last_face
+                    self._draw_corner_box(display, fx, fy, fx + fw, fy + fh, (200, 200, 200), thickness=1, length=16)
 
-            # Update labels
-            self._update_eye_label(self.left_var, self.left_label, left_prob)
-            self._update_eye_label(self.right_var, self.right_label, right_prob)
-            self._update_status(left_prob, right_prob)
-        else:
-            self.status_var.set("No eyes detected")
-            self.status_label.config(foreground="gray")
-            self.left_var.set("--")
-            self.right_var.set("--")
+                # Draw corner-bracket boxes around eyes
+                self._draw_corner_box(display, left_box[0],  left_box[1],  left_box[2],  left_box[3],  left_color)
+                self._draw_corner_box(display, right_box[0], right_box[1], right_box[2], right_box[3], right_color)
 
-        self._show_frame(display)
-        self.root.after(15, self._update)
+                # Show crops with colored borders
+                self._show_crop(left_crop,  self.left_canvas)
+                self._show_crop(right_crop, self.right_canvas)
+                self.left_canvas.config(highlightbackground="green" if (left_prob and left_prob > self.threshold) else "red")
+                self.right_canvas.config(highlightbackground="green" if (right_prob and right_prob > self.threshold) else "red")
+
+                # Update labels
+                self._update_eye_label(self.left_var,  self.left_label,  left_prob)
+                self._update_eye_label(self.right_var, self.right_label, right_prob)
+                self._update_status(left_prob, right_prob)
+            else:
+                self.last_left_prob = None
+                self.last_right_prob = None
+                self.status_var.set("No face detected")
+                self.status_label.config(foreground="gray")
+                self.left_var.set("--")
+                self.right_var.set("--")
+                self.left_canvas.config(highlightbackground="gray")
+                self.right_canvas.config(highlightbackground="gray")
+
+            # FPS overlay
+            cv2.putText(display, f"FPS: {self.fps:.0f}", (8, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+
+            self._show_frame(display)
+        except Exception as e:
+            print(f"Frame error: {e}")
+        finally:
+            self.root.after(15, self._update)
 
     def _update_eye_label(self, var, label, prob):
         if prob is None:
@@ -370,10 +399,10 @@ class EyeDetectorGUI:
         if crop is None or crop.size == 0:
             return
         rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-        rgb = cv2.resize(rgb, (80, 60))
+        rgb = cv2.resize(rgb, (120, 90))
         img = ImageTk.PhotoImage(Image.fromarray(rgb))
         canvas.delete("all")
-        canvas.create_image(40, 30, image=img)
+        canvas.create_image(60, 45, image=img)
         canvas.image = img
 
     def _show_frame(self, frame):
