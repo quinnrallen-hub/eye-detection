@@ -137,9 +137,10 @@ def train():
     print(f"Using device: {DEVICE}")
 
     # Load data - use cropped eye images
+    _base = Path(__file__).parent
     image_paths, labels = load_dataset(
-        "/home/quinn/eye_detection_project/cropped_eyes_coco.json",
-        "/home/quinn/eye_detection_project/cropped_eyes"
+        str(_base / "cropped_eyes_coco.json"),
+        str(_base / "cropped_eyes")
     )
 
     print(f"Loaded {len(image_paths)} images")
@@ -221,7 +222,8 @@ def train():
         if val_acc > best_acc:
             best_acc = val_acc
             patience = 0
-            torch.save(model.state_dict(), "/home/quinn/eye_detection_project/eye_classifier.pth")
+            save_path = str(_base / "eye_classifier.pth")
+            torch.save(model.state_dict(), save_path)
             print(f"  -> Saved best model (Val Acc: {val_acc:.1f}%)")
         else:
             patience += 1
@@ -230,7 +232,7 @@ def train():
                 break
 
     print(f"\nTraining complete! Best validation accuracy: {best_acc:.1f}%")
-    print("Model saved to: /home/quinn/eye_detection_project/eye_classifier.pth")
+    print(f"Model saved to: {_base / 'eye_classifier.pth'}")
 
 
 if __name__ == "__main__":

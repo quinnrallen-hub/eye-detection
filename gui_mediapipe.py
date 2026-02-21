@@ -12,11 +12,13 @@ from PIL import Image, ImageTk
 import mediapipe as mp
 import torch
 import torch.nn as nn
+from pathlib import Path
 
 # --- Config ---
 IMG_SIZE = 64
-MODEL_PATH = "/home/quinn/eye_detection_project/eye_classifier.pth"
-LANDMARKER_PATH = "/home/quinn/eye_detection_project/face_landmarker.task"
+_BASE = Path(__file__).parent
+MODEL_PATH = str(_BASE / "eye_classifier.pth")
+LANDMARKER_PATH = str(_BASE / "face_landmarker.task")
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
@@ -58,9 +60,6 @@ class EyeCNN(nn.Module):
         x = self.classifier(x)
         return x
 
-
-# ESP32-CAM stream URL (change IP to match your camera)
-ESPCAM_URL = "http://192.168.251.119:81/stream"
 
 # MediaPipe landmark indices (from subject's perspective)
 # Left eye = 362-398 range, Right eye = 33-173 range
@@ -205,17 +204,16 @@ class EyeDetectorGUI:
     def _detect_cameras(self):
         self.available_cameras = []
 
-        # Check local cameras
+        # Check local cameras (isOpened() only — no blocking read)
         for i in range(5):
             cap = cv2.VideoCapture(i)
             if cap.isOpened():
-                ret, _ = cap.read()
-                if ret:
-                    self.available_cameras.append(("local", i, f"Camera {i}"))
-                cap.release()
+                self.available_cameras.append(("local", i, f"Camera {i}"))
+            cap.release()
 
-        # Add ESP32-CAM option
-        self.available_cameras.append(("esp", ESPCAM_URL, "ESP32-CAM"))
+        # Add ESP32-CAM option using current IP field value
+        esp_url = f"http://{self.esp_ip_var.get().strip()}:81/stream"
+        self.available_cameras.append(("esp", esp_url, "ESP32-CAM"))
 
         if self.available_cameras:
             self.cam_combo["values"] = [c[2] for c in self.available_cameras]
@@ -326,18 +324,6 @@ class EyeDetectorGUI:
 
         return frame[y1:y2, x1:x2].copy(), (x1, y1, x2, y2)
 
-    def _predict_ear(self, ear_value):
-        """Use EAR to determine if eye is open. Returns open probability."""
-        # EAR > 0.22 typically means open, < 0.22 means closed
-        # Convert to a probability-like value
-        if ear_value > 0.30:
-            return 1.0
-        elif ear_value < 0.15:
-            return 0.0
-        else:
-            # Linear interpolation between 0.15 and 0.30
-            return (ear_value - 0.15) / 0.15
-
     def _preprocess_crop(self, crop):
         """Preprocess a single crop for CNN."""
         if crop is None or crop.size == 0:
@@ -383,34 +369,6 @@ class EyeDetectorGUI:
             print(f"CNN predict error: {e}")
             return None, None
 
-    def _predict_cnn(self, crop):
-        """Use custom CNN to predict if eye is open. Returns open probability."""
-        if crop is None or crop.size == 0:
-            return None
-
-        h, w = crop.shape[:2]
-        if h < 10 or w < 10:
-            return None
-
-        try:
-            # Preprocess: RGB, resize, normalize to 0-1
-            img = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
-            img = img.astype(np.float32) / 255.0
-            img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
-
-            # Run inference
-            with torch.no_grad():
-                output = self.model(img)
-                probs = torch.softmax(output, dim=1)
-                # Class 0 = open, Class 1 = closed
-                open_prob = probs[0, 0].item()
-
-            return open_prob
-        except Exception as e:
-            print(f"CNN predict error: {e}")
-            return None
-
     def _get_brightness(self, frame):
         """Get average brightness of frame (0-255)."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -452,96 +410,100 @@ class EyeDetectorGUI:
             self.root.after(30, self._update)
             return
 
-        ret, frame = self.cap.read()
-        if not ret:
-            self.root.after(30, self._update)
-            return
+        try:
+            ret, frame = self.cap.read()
+            if not ret:
+                return  # finally reschedules
 
-        # Update brightness display and auto-adjust threshold if enabled
-        brightness = self._get_brightness(frame)
-        self.bright_var.set(f"Brightness: {brightness:.0f}")
+            # Update brightness display and auto-adjust threshold if enabled
+            brightness = self._get_brightness(frame)
+            self.bright_var.set(f"Brightness: {brightness:.0f}")
 
-        if self.auto_thresh_var.get():
-            self._auto_threshold(frame)
+            if self.auto_thresh_var.get():
+                self._auto_threshold(frame)
 
-        h, w = frame.shape[:2]
-        display = frame.copy()
+            h, w = frame.shape[:2]
+            display = frame.copy()
 
-        # Detect face
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        result = self.landmarker.detect(mp_img)
+            # Detect face
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = self.landmarker.detect(mp_img)
 
-        left_prob, right_prob = None, None
+            left_prob, right_prob = None, None
 
-        if result.face_landmarks:
-            lm = result.face_landmarks[0]
+            if result.face_landmarks:
+                lm = result.face_landmarks[0]
 
-            # EAR - use this for detection (more reliable than CNN)
-            left_ear = self._compute_ear(lm, LEFT_EYE_EAR)
-            right_ear = self._compute_ear(lm, RIGHT_EYE_EAR)
-            self.ear_var.set(f"EAR: L={left_ear:.2f} R={right_ear:.2f}")
+                # EAR - use this for detection (more reliable than CNN)
+                left_ear = self._compute_ear(lm, LEFT_EYE_EAR)
+                right_ear = self._compute_ear(lm, RIGHT_EYE_EAR)
+                self.ear_var.set(f"EAR: L={left_ear:.2f} R={right_ear:.2f}")
 
-            # Get eye crops for prediction
-            left_crop, left_box = self._crop_eye(frame, lm, LEFT_EYE_CONTOUR)
-            right_crop, right_box = self._crop_eye(frame, lm, RIGHT_EYE_CONTOUR)
+                # Get eye crops for prediction
+                left_crop, left_box = self._crop_eye(frame, lm, LEFT_EYE_CONTOUR)
+                right_crop, right_box = self._crop_eye(frame, lm, RIGHT_EYE_CONTOUR)
 
-            # Only run CNN every N frames to reduce lag
-            self.frame_count += 1
-            if self.frame_count >= self.inference_interval:
-                self.frame_count = 0
-                self.last_left_prob, self.last_right_prob = self._predict_batch(left_crop, right_crop)
+                # Only run CNN every N frames to reduce lag
+                self.frame_count += 1
+                if self.frame_count >= self.inference_interval:
+                    self.frame_count = 0
+                    self.last_left_prob, self.last_right_prob = self._predict_batch(left_crop, right_crop)
 
-            left_prob = self.last_left_prob
-            right_prob = self.last_right_prob
+                left_prob = self.last_left_prob
+                right_prob = self.last_right_prob
 
-            # Get face bounding box for zoom
-            face_xs = [lm[i].x * w for i in range(len(lm))]
-            face_ys = [lm[i].y * h for i in range(len(lm))]
-            fx1, fx2 = int(min(face_xs)), int(max(face_xs))
-            fy1, fy2 = int(min(face_ys)), int(max(face_ys))
+                # Get face bounding box for zoom
+                face_xs = [lm[i].x * w for i in range(len(lm))]
+                face_ys = [lm[i].y * h for i in range(len(lm))]
+                fx1, fx2 = int(min(face_xs)), int(max(face_xs))
+                fy1, fy2 = int(min(face_ys)), int(max(face_ys))
 
-            # Add padding
-            pad = int((fx2 - fx1) * 0.4)
-            fx1, fy1 = max(0, fx1 - pad), max(0, fy1 - pad)
-            fx2, fy2 = min(w, fx2 + pad), min(h, fy2 + pad)
+                # Add padding
+                pad = int((fx2 - fx1) * 0.4)
+                fx1, fy1 = max(0, fx1 - pad), max(0, fy1 - pad)
+                fx2, fy2 = min(w, fx2 + pad), min(h, fy2 + pad)
 
-            # Display eye crops and calculate adjusted boxes
-            adj_left_box, adj_right_box = None, None
-            left_color, right_color = (0, 255, 0), (0, 255, 0)
+                # Display eye crops and calculate adjusted boxes
+                adj_left_box, adj_right_box = None, None
+                left_color, right_color = (0, 255, 0), (0, 255, 0)
 
-            if left_crop is not None:
-                left_color = (0, 255, 0) if (left_prob and left_prob > self.threshold) else (0, 0, 255)
-                adj_left_box = (left_box[0] - fx1, left_box[1] - fy1, left_box[2] - fx1, left_box[3] - fy1)
-                self._show_crop(left_crop, self.left_canvas)
+                if left_crop is not None:
+                    left_color = (0, 255, 0) if (left_prob and left_prob > self.threshold) else (0, 0, 255)
+                    adj_left_box = (left_box[0] - fx1, left_box[1] - fy1, left_box[2] - fx1, left_box[3] - fy1)
+                    self._show_crop(left_crop, self.left_canvas)
 
-            if right_crop is not None:
-                right_color = (0, 255, 0) if (right_prob and right_prob > self.threshold) else (0, 0, 255)
-                adj_right_box = (right_box[0] - fx1, right_box[1] - fy1, right_box[2] - fx1, right_box[3] - fy1)
-                self._show_crop(right_crop, self.right_canvas)
+                if right_crop is not None:
+                    right_color = (0, 255, 0) if (right_prob and right_prob > self.threshold) else (0, 0, 255)
+                    adj_right_box = (right_box[0] - fx1, right_box[1] - fy1, right_box[2] - fx1, right_box[3] - fy1)
+                    self._show_crop(right_crop, self.right_canvas)
 
-            # Zoom to face region
-            display = display[fy1:fy2, fx1:fx2].copy()
+                # Zoom to face region (guard against degenerate box)
+                if fx2 > fx1 and fy2 > fy1:
+                    display = display[fy1:fy2, fx1:fx2].copy()
 
-            # Draw rectangles on zoomed display
-            if adj_left_box is not None:
-                cv2.rectangle(display, (adj_left_box[0], adj_left_box[1]), (adj_left_box[2], adj_left_box[3]), left_color, 2)
-            if adj_right_box is not None:
-                cv2.rectangle(display, (adj_right_box[0], adj_right_box[1]), (adj_right_box[2], adj_right_box[3]), right_color, 2)
+                # Draw rectangles on zoomed display
+                if adj_left_box is not None:
+                    cv2.rectangle(display, (adj_left_box[0], adj_left_box[1]), (adj_left_box[2], adj_left_box[3]), left_color, 2)
+                if adj_right_box is not None:
+                    cv2.rectangle(display, (adj_right_box[0], adj_right_box[1]), (adj_right_box[2], adj_right_box[3]), right_color, 2)
 
-            # Update labels
-            self._update_eye_label(self.left_var, self.left_label, left_prob)
-            self._update_eye_label(self.right_var, self.right_label, right_prob)
-            self._update_status(left_prob, right_prob)
-        else:
-            self.status_var.set("No face detected")
-            self.status_label.config(foreground="gray")
-            self.ear_var.set("EAR: --")
-            self.left_var.set("--")
-            self.right_var.set("--")
+                # Update labels
+                self._update_eye_label(self.left_var, self.left_label, left_prob)
+                self._update_eye_label(self.right_var, self.right_label, right_prob)
+                self._update_status(left_prob, right_prob)
+            else:
+                self.status_var.set("No face detected")
+                self.status_label.config(foreground="gray")
+                self.ear_var.set("EAR: --")
+                self.left_var.set("--")
+                self.right_var.set("--")
 
-        self._show_frame(display)
-        self.root.after(15, self._update)
+            self._show_frame(display)
+        except Exception as e:
+            print(f"Frame error: {e}")
+        finally:
+            self.root.after(15, self._update)
 
     def _update_eye_label(self, var, label, prob):
         if prob is None:

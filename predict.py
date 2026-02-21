@@ -9,29 +9,42 @@ import cv2
 import torch
 import torch.nn as nn
 import numpy as np
+from pathlib import Path
 
 IMG_SIZE = 64
+MODEL_PATH = str(Path(__file__).parent / "eye_classifier.pth")
 
 class EyeCNN(nn.Module):
+    """Must match training architecture in train_eye_classifier.py."""
     def __init__(self):
         super().__init__()
         self.features = nn.Sequential(
             nn.Conv2d(3, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.MaxPool2d(2),
+
             nn.Conv2d(32, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.MaxPool2d(2),
+
             nn.Conv2d(64, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(),
             nn.MaxPool2d(2),
+
+            nn.Conv2d(128, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),
         )
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(128 * 8 * 8, 256),
+            nn.Linear(256, 128),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(256, 2)
+            nn.Linear(128, 2)
         )
 
     def forward(self, x):
@@ -44,7 +57,7 @@ def predict(image_path):
 
     model = EyeCNN().to(device)
     model.load_state_dict(torch.load(
-        "/home/quinn/eye_detection_project/eye_classifier.pth",
+        MODEL_PATH,
         map_location=device,
         weights_only=True
     ))

@@ -47,7 +47,7 @@ def calculate_ear(landmarks, eye_top, eye_bottom, eye_left, eye_right):
 def create_landmarker():
     """Create MediaPipe FaceLandmarker"""
     base_options = python.BaseOptions(
-        model_asset_path='/home/quinn/eye_detection_project/face_landmarker.task'
+        model_asset_path=str(Path(__file__).parent / 'face_landmarker.task')
     )
     options = vision.FaceLandmarkerOptions(
         base_options=base_options,
@@ -124,9 +124,6 @@ def relabel_dataset(images_dir, output_json, ear_threshold=0.2):
     landmarker = create_landmarker()
 
     for idx, img_path in enumerate(image_files):
-        if img_path.name.endswith('.json'):
-            continue
-
         try:
             state, ear, blendshapes = detect_eye_state(landmarker, img_path, ear_threshold)
         except Exception as e:
@@ -188,7 +185,8 @@ def relabel_dataset(images_dir, output_json, ear_threshold=0.2):
     return stats
 
 if __name__ == "__main__":
-    images_dir = "/home/quinn/eye_detection_project/Augen_Bilder"
-    output_json = "/home/quinn/eye_detection_project/relabeled_coco.json"
+    _base = Path(__file__).parent
+    images_dir = str(_base / "Augen_Bilder")
+    output_json = str(_base / "relabeled_coco.json")
 
     stats = relabel_dataset(images_dir, output_json, ear_threshold=0.2)

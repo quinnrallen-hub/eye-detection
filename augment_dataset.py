@@ -7,7 +7,6 @@ import cv2
 import json
 import numpy as np
 from pathlib import Path
-import random
 
 def augment_image(image):
     """Apply random augmentations and return list of augmented images."""
@@ -45,10 +44,10 @@ def augment_dataset(input_json, images_dir, output_dir, output_json):
     with open(input_json) as f:
         coco_data = json.load(f)
 
-    # Build image_id to annotation mapping
+    # Build image_id to annotation mapping (keep first annotation per image)
     img_to_ann = {}
     for ann in coco_data['annotations']:
-        img_to_ann[ann['image_id']] = ann
+        img_to_ann.setdefault(ann['image_id'], ann)
 
     new_images = []
     new_annotations = []
@@ -123,9 +122,10 @@ def augment_dataset(input_json, images_dir, output_dir, output_json):
     print(f"Saved to: {output_dir}")
 
 if __name__ == "__main__":
+    _base = Path(__file__).parent
     augment_dataset(
-        input_json="/home/quinn/eye_detection_project/relabeled_coco.json",
-        images_dir="/home/quinn/eye_detection_project/Augen_Bilder",
-        output_dir="/home/quinn/eye_detection_project/augmented_images",
-        output_json="/home/quinn/eye_detection_project/augmented_coco.json"
+        input_json=str(_base / "relabeled_coco.json"),
+        images_dir=str(_base / "Augen_Bilder"),
+        output_dir=str(_base / "augmented_images"),
+        output_json=str(_base / "augmented_coco.json")
     )

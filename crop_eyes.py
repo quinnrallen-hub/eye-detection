@@ -17,8 +17,9 @@ RIGHT_EYE_CONTOUR = [33, 7, 163, 144, 145, 153, 154, 155,
                      133, 173, 157, 158, 159, 160, 161, 246]
 
 PADDING = 0.5  # Extra padding around eye
-OUTPUT_DIR = Path("/home/quinn/eye_detection_project/cropped_eyes")
-OUTPUT_JSON = "/home/quinn/eye_detection_project/cropped_eyes_coco.json"
+_BASE = Path(__file__).parent
+OUTPUT_DIR = _BASE / "cropped_eyes"
+OUTPUT_JSON = str(_BASE / "cropped_eyes_coco.json")
 
 
 def crop_eye(frame, landmarks, indices):
@@ -45,16 +46,16 @@ def crop_eye(frame, landmarks, indices):
 
 def main():
     # Load original annotations
-    with open("/home/quinn/eye_detection_project/augmented_coco.json") as f:
+    with open(_BASE / "augmented_coco.json") as f:
         data = json.load(f)
 
-    img_dir = Path("/home/quinn/eye_detection_project/augmented_images")
+    img_dir = _BASE / "augmented_images"
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     # Setup MediaPipe
     options = mp.tasks.vision.FaceLandmarkerOptions(
         base_options=mp.tasks.BaseOptions(
-            model_asset_path="/home/quinn/eye_detection_project/face_landmarker.task"
+            model_asset_path=str(_BASE / "face_landmarker.task")
         ),
         running_mode=mp.tasks.vision.RunningMode.IMAGE,
         num_faces=1,

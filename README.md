@@ -12,7 +12,7 @@ Real-time eye open/closed detection using a custom-trained CNN (98% accuracy).
 ## Requirements
 
 ```bash
-pip install opencv-python numpy pillow torch
+pip install opencv-python numpy pillow torch requests
 ```
 
 ## Usage
