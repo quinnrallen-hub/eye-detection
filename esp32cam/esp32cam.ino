@@ -13,8 +13,8 @@
 #include "esp_http_server.h"
 
 // === CHANGE THESE ===
-const char* ssid = "bee0126";
-const char* password = "";
+const char* ssid     = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
 
 // AI Thinker ESP32-CAM pins
 #define PWDN_GPIO_NUM     32

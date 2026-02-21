@@ -13,6 +13,8 @@ from PIL import Image, ImageTk
 import torch
 import torch.nn as nn
 import time
+import threading
+import requests
 
 # --- Config ---
 IMG_SIZE = 64
@@ -81,6 +83,8 @@ class EyeDetectorGUI:
         self.last_face = None
         self.last_time = time.time()
         self.fps = 0
+        self.closed_since = None
+        self.alert_active = False
 
         # Load model
         self.model = self._load_model()
@@ -109,6 +113,19 @@ class EyeDetectorGUI:
         self.cam_var = tk.IntVar(value=0)
         ttk.Spinbox(top, from_=0, to=4, textvariable=self.cam_var, width=5).pack(side=tk.LEFT, padx=5)
         ttk.Button(top, text="Switch", command=self._switch_camera).pack(side=tk.LEFT, padx=5)
+
+        # ESP32 config row
+        esp_row = ttk.Frame(main)
+        esp_row.pack(fill=tk.X, pady=2)
+
+        ttk.Label(esp_row, text="ESP32-CAM URL:").pack(side=tk.LEFT, padx=5)
+        self.cam_url_var = tk.StringVar(value="")
+        ttk.Entry(esp_row, textvariable=self.cam_url_var, width=28).pack(side=tk.LEFT, padx=5)
+        ttk.Button(esp_row, text="Use ESP32-CAM", command=self._connect_esp_cam).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(esp_row, text="Alert IP:").pack(side=tk.LEFT, padx=15)
+        self.alert_ip_var = tk.StringVar(value="")
+        ttk.Entry(esp_row, textvariable=self.alert_ip_var, width=16).pack(side=tk.LEFT, padx=5)
 
         # Video display
         self.video_canvas = tk.Canvas(main, width=640, height=400, bg="black")
@@ -157,6 +174,31 @@ class EyeDetectorGUI:
         self.thresh_slider.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
         self.thresh_label = ttk.Label(thresh_frame, text="0.50", width=5)
         self.thresh_label.pack(side=tk.LEFT, padx=5)
+
+    def _connect_esp_cam(self):
+        url = self.cam_url_var.get().strip()
+        if not url:
+            return
+        if self.cap:
+            self.cap.release()
+        self.last_left_prob = None
+        self.last_right_prob = None
+        self.cap = cv2.VideoCapture(url)
+        if not self.running:
+            self.running = True
+            self._update()
+
+    def _send_alert(self, on: bool):
+        ip = self.alert_ip_var.get().strip()
+        if not ip:
+            return
+        url = f"http://{ip}/alert/{'on' if on else 'off'}"
+        def _req():
+            try:
+                requests.get(url, timeout=1)
+            except Exception:
+                pass
+        threading.Thread(target=_req, daemon=True).start()
 
     def _switch_camera(self):
         if self.cap:
@@ -381,6 +423,10 @@ class EyeDetectorGUI:
         if left_prob is None and right_prob is None:
             self.status_var.set("Detection failed")
             self.status_label.config(foreground="gray")
+            self.closed_since = None
+            if self.alert_active:
+                self.alert_active = False
+                self._send_alert(False)
             return
 
         if left_prob is not None and right_prob is not None:
@@ -388,11 +434,30 @@ class EyeDetectorGUI:
         else:
             avg = left_prob if left_prob is not None else right_prob
 
-        if avg > self.threshold:
+        eyes_open = avg > self.threshold
+
+        if eyes_open:
             self.status_var.set("EYES OPEN")
             self.status_label.config(foreground="green")
+            self.closed_since = None
+            if self.alert_active:
+                self.alert_active = False
+                self._send_alert(False)
         else:
-            self.status_var.set("EYES CLOSED")
+            # Track how long eyes have been closed
+            if self.closed_since is None:
+                self.closed_since = time.time()
+            closed_duration = time.time() - self.closed_since
+
+            if closed_duration >= 2.0:
+                secs = int(closed_duration)
+                self.status_var.set(f"EYES CLOSED ({secs}s)")
+                if not self.alert_active:
+                    self.alert_active = True
+                    self._send_alert(True)
+            else:
+                self.status_var.set("EYES CLOSED")
+
             self.status_label.config(foreground="red")
 
     def _show_crop(self, crop, canvas):
@@ -419,6 +484,8 @@ class EyeDetectorGUI:
 
     def on_close(self):
         self.running = False
+        if self.alert_active:
+            self._send_alert(False)
         if self.cap:
             self.cap.release()
         self.root.destroy()
